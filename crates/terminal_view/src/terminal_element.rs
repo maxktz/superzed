@@ -1033,6 +1033,10 @@ impl Element for TerminalElement {
                     origin.x += gutter;
 
                     if matches!(self.terminal_view.read(cx).mode, TerminalMode::Standalone) {
+                        let should_anchor_to_bottom = {
+                            let content = self.terminal.read(cx).last_content();
+                            content.scrolled_to_bottom && content.bottom_row_occupied
+                        };
                         let scale_factor = window.scale_factor();
                         let line_height_pixels = px(line_height);
                         let line_height_device_px = (f32::from(line_height_pixels) * scale_factor)
@@ -1054,12 +1058,7 @@ impl Element for TerminalElement {
                         let padding = px(padding_device_px as f32 / scale_factor.max(1.0));
 
                         size.height = snapped_height;
-                        let should_bottom_anchor = {
-                            let terminal = self.terminal.read(cx);
-                            terminal.scrolled_to_bottom()
-                                && terminal_content_reaches_bottom(terminal.last_content())
-                        };
-                        if should_bottom_anchor {
+                        if should_anchor_to_bottom {
                             origin.y += padding;
                         }
                     }
@@ -1354,7 +1353,6 @@ impl Element for TerminalElement {
             };
 
             let terminal_input_handler = TerminalInputHandler {
-                terminal: self.terminal.clone(),
                 terminal_view: self.terminal_view.clone(),
                 cursor_bounds: layout.ime_cursor_bounds.map(|bounds| bounds + origin),
                 workspace: self.workspace.clone(),
@@ -1515,7 +1513,6 @@ impl IntoElement for TerminalElement {
 }
 
 struct TerminalInputHandler {
-    terminal: Entity<Terminal>,
     terminal_view: Entity<TerminalView>,
     workspace: WeakEntity<Workspace>,
     cursor_bounds: Option<Bounds<Pixels>>,
@@ -1526,22 +1523,15 @@ impl InputHandler for TerminalInputHandler {
         &mut self,
         _ignore_disabled_input: bool,
         _: &mut Window,
-        cx: &mut App,
+        _cx: &mut App,
     ) -> Option<UTF16Selection> {
-        if self
-            .terminal
-            .read(cx)
-            .last_content
-            .mode
-            .contains(Modes::ALT_SCREEN)
-        {
-            None
-        } else {
-            Some(UTF16Selection {
-                range: 0..0,
-                reversed: false,
-            })
-        }
+        // Always return a valid selection for IME positioning,
+        // even in ALT_SCREEN mode (fullscreen TUI apps like opencode, vim, etc.)
+        // The terminal still has a cursor position that should be used for IME candidate window placement.
+        Some(UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
     }
 
     fn marked_text_range(
@@ -1650,23 +1640,6 @@ pub fn is_blank(cell: &Cell) -> bool {
     }
 
     true
-}
-
-fn terminal_content_reaches_bottom(content: &Content) -> bool {
-    let Some(last_line) = content.terminal_bounds.num_lines().checked_sub(1) else {
-        return false;
-    };
-
-    let display_offset = i32::try_from(content.display_offset).unwrap_or(i32::MAX);
-    let cursor_line = content.cursor.point.line.saturating_add(display_offset);
-    if cursor_line >= 0 && cursor_line as usize >= last_line {
-        return true;
-    }
-
-    content.cells.iter().any(|cell| {
-        let line = cell.point.line.saturating_add(display_offset);
-        line >= 0 && line as usize >= last_line && !is_blank(&cell.cell)
-    })
 }
 
 fn to_highlighted_range_lines(

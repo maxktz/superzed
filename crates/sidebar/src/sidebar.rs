@@ -16,7 +16,7 @@ use agent_ui::threads_archive_view::{
     fuzzy_match_positions,
 };
 use agent_ui::{
-    AcpThreadImportOnboarding, AddContextServer, Agent, AgentPanel, AgentPanelEvent,
+    AcpThreadImportOnboarding, Agent, AgentPanel, AgentPanelEvent,
     AgentThreadItem, AgentThreadSource, ArchiveSelectedThread, ConversationView,
     CrossChannelImportOnboarding, DEFAULT_THREAD_TITLE, ManageProfiles, NewTerminalThread,
     NewThread, RenameSelectedThread, TerminalId, ThreadId, ThreadImportModal,
@@ -31,9 +31,9 @@ use feature_flags::{
     AgentThreadWorktreeLabel, AgentThreadWorktreeLabelFlag, FeatureFlag, FeatureFlagAppExt as _,
 };
 use gpui::{
-    Action as _, AnyElement, App, ClickEvent, Context, DismissEvent, Entity, EntityId, FocusHandle,
-    Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task, TaskExt,
-    WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
+    Action as _, AnyElement, App, ClickEvent, Context, Decorations, DismissEvent, Entity, EntityId,
+    FocusHandle, Focusable, KeyContext, ListState, Modifiers, Pixels, Render, SharedString, Task,
+    TaskExt, WeakEntity, Window, WindowBackgroundAppearance, WindowHandle, linear_color_stop,
     linear_gradient, list, prelude::*, px,
 };
 use itertools::Itertools;
@@ -53,7 +53,7 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use theme::ActiveTheme;
+use theme::{ActiveTheme, CLIENT_SIDE_DECORATION_ROUNDING};
 use ui::{
     AgentThreadStatus, CommonAnimationExt, ContextMenu, ContextMenuEntry, GradientFade,
     HighlightedLabel, KeyBinding, PopoverMenu, PopoverMenuHandle, ProjectEmptyState, ScrollAxes,
@@ -7613,7 +7613,7 @@ impl Sidebar {
             return false;
         };
         let project = workspace.read(cx).project().clone();
-        let Ok(rel_path) = util::rel_path::RelPath::unix("AGENTS.md") else {
+        let Ok(rel_path) = util::rel_path::RelPath::from_unix_str("AGENTS.md") else {
             return false;
         };
         project
@@ -7724,8 +7724,13 @@ impl Sidebar {
 
                         menu = menu
                             .header("MCP Servers")
-                            .action("Add Custom Server…", Box::new(AddContextServer::local()))
-                            .action("Add Remote Server…", Box::new(AddContextServer::remote()))
+                            .action(
+                                "Add Server…",
+                                Box::new(zed_actions::OpenSettingsAt {
+                                    path: "context_servers".to_string(),
+                                    target: None,
+                                }),
+                            )
                             .action(
                                 "Install New Servers…",
                                 Box::new(zed_actions::Extensions {
@@ -8288,8 +8293,48 @@ impl Render for Sidebar {
                 this.recent_projects_popover_handle.toggle(window, cx);
             }))
             .font(ui_font)
-            .h_full()
-            .w(self.width)
+            .map(|el| {
+                let on_left = self.side(cx) == SidebarSide::Left;
+                match window.window_decorations() {
+                    Decorations::Server => el.h_full().w(self.width),
+                    // With client-side decorations the sidebar owns the window
+                    // corners on its side, so round them like the title bar and
+                    // status bar do. The sidebar is stretched 1px outwards over
+                    // the window border on untiled edges (with compensating
+                    // padding) so its rounded background lines up exactly with
+                    // the window shape, avoiding a transparent gap in the
+                    // rounded corners.
+                    Decorations::Client { tiling, .. } => el
+                        .absolute()
+                        .top(if tiling.top { px(0.) } else { px(-1.) })
+                        .bottom(if tiling.bottom { px(0.) } else { px(-1.) })
+                        .when(!tiling.top, |el| el.pt_px())
+                        .when(!tiling.bottom, |el| el.pb_px())
+                        .map(|el| {
+                            if on_left {
+                                el.right(px(0.))
+                                    .left(if tiling.left { px(0.) } else { px(-1.) })
+                                    .when(!tiling.left, |el| el.pl(px(1.)))
+                            } else {
+                                el.left(px(0.))
+                                    .right(if tiling.right { px(0.) } else { px(-1.) })
+                                    .when(!tiling.right, |el| el.pr(px(1.)))
+                            }
+                        })
+                        .when(on_left && !(tiling.top || tiling.left), |el| {
+                            el.rounded_tl(CLIENT_SIDE_DECORATION_ROUNDING)
+                        })
+                        .when(on_left && !(tiling.bottom || tiling.left), |el| {
+                            el.rounded_bl(CLIENT_SIDE_DECORATION_ROUNDING)
+                        })
+                        .when(!on_left && !(tiling.top || tiling.right), |el| {
+                            el.rounded_tr(CLIENT_SIDE_DECORATION_ROUNDING)
+                        })
+                        .when(!on_left && !(tiling.bottom || tiling.right), |el| {
+                            el.rounded_br(CLIENT_SIDE_DECORATION_ROUNDING)
+                        }),
+                }
+            })
             .bg(bg)
             .overflow_hidden()
             .rounded_lg()

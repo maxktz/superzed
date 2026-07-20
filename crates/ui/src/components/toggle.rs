@@ -353,6 +353,7 @@ pub struct Switch {
     size: SwitchSize,
     tab_index: Option<isize>,
     aria_label: Option<SharedString>,
+    aria_description: Option<SharedString>,
 }
 
 impl Switch {
@@ -373,6 +374,7 @@ impl Switch {
             size: SwitchSize::default(),
             tab_index: None,
             aria_label: None,
+            aria_description: None,
         }
     }
 
@@ -426,6 +428,7 @@ impl Switch {
         self
     }
 
+
     pub fn full_width(mut self, full_width: bool) -> Self {
         self.full_width = full_width;
         self
@@ -448,10 +451,17 @@ impl Switch {
         self.aria_label = Some(label.into());
         self
     }
+
+    /// Sets the supplementary description announced by assistive technology
+    /// after the switch's name, role, and state.
+    pub fn aria_description(mut self, description: impl Into<SharedString>) -> Self {
+        self.aria_description = Some(description.into());
+        self
+    }
 }
 
 impl RenderOnce for Switch {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let is_on = self.toggle_state == ToggleState::Selected;
         let adjust_ratio = if is_light(cx) { 1.5 } else { 1.0 };
 
@@ -482,11 +492,22 @@ impl RenderOnce for Switch {
             ),
             SwitchSize::Small => (rems_from_px(28.), rems_from_px(16.), rems_from_px(10.)),
         };
+        let aria_description = self.aria_description;
+        let aria_keyshortcuts = self
+            .key_binding
+            .as_ref()
+            .and_then(|key_binding| key_binding.keyboard_shortcut_text(window, cx));
 
         let switch = div()
             .id((self.id.clone(), "switch"))
             .role(Role::Switch)
             .when_some(aria_label, |this, label| this.aria_label(label))
+            .when_some(aria_keyshortcuts, |this, keyshortcuts| {
+                this.aria_keyshortcuts(keyshortcuts)
+            })
+            .when_some(aria_description, |this, description| {
+                this.aria_description(description)
+            })
             .aria_toggled(match self.toggle_state {
                 ToggleState::Selected => Toggled::True,
                 ToggleState::Indeterminate => Toggled::Mixed,
