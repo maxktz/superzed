@@ -106,6 +106,12 @@ impl From<SerializedProjectGroup> for ProjectGroupKey {
 }
 
 /// Per-window state for a MultiWorkspace, persisted to KVP.
+///
+/// `project_groups` preserves the sidebar's group ordering (one entry per
+/// [`ProjectGroupKey`], including its local/remote location), while
+/// `active_workspace_id` records which member workspace was presented.
+/// Workspace contents are persisted separately, per workspace, in SQLite —
+/// this struct only captures the window-level grouping and sidebar state.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MultiWorkspaceState {
     pub active_workspace_id: Option<WorkspaceId>,

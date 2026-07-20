@@ -196,7 +196,7 @@ fn render_sidebar_header_controls_for_state(
         "Open Sidebar"
     };
     let on_right = sidebar_side == SidebarSide::Right;
-    let sidebar_multi_workspace = multi_workspace.clone();
+    let sidebar_multi_workspace = multi_workspace;
 
     let sidebar_toggle_button = sidebar_side_context_menu("sidebar-toggle-menu", cx)
         .anchor(if on_right {
@@ -503,6 +503,32 @@ pub struct SerializedProjectGroupState {
     pub expanded: bool,
 }
 
+/// Sidebar-facing metadata for one project group, keyed by [`ProjectGroupKey`].
+///
+/// A project group is *not* a workspace: it is a bucket that zero or more
+/// retained workspaces fall into. Membership is derived on demand (see
+/// [`MultiWorkspace::derived_project_groups`]) by comparing each retained
+/// workspace's live `project_group_key` against `key`, so this struct only
+/// stores what cannot be derived:
+///
+/// - `key`: the group identity — the project's main-worktree [`PathList`]
+///   plus the optional remote host. Two groups with identical paths but
+///   different hosts (e.g. a local checkout and the same path over SSH)
+///   are distinct groups.
+/// - `expanded`: whether the group's thread list is expanded in the sidebar.
+/// - `last_active_workspace`: which member workspace was most recently
+///   active, so re-activating the group returns the user to it. Held weakly;
+///   it is validated against the live key before use and cleared when the
+///   workspace is detached.
+///
+/// Lifecycle: groups are created by
+/// [`MultiWorkspace::ensure_project_group_state`] when a workspace with a
+/// new key is retained (new groups are inserted at the front of the list),
+/// re-keyed in place by [`MultiWorkspace::rekey_project_group`] when a
+/// project's worktree paths change (`WorktreePathsChanged`), and removed
+/// when the user closes the group. The ordered list of these states is the
+/// single source of truth for sidebar ordering and for project cycling
+/// (`NextProject` / `PreviousProject`).
 #[derive(Clone)]
 pub struct ProjectGroupState {
     pub key: ProjectGroupKey,
@@ -510,6 +536,52 @@ pub struct ProjectGroupState {
     pub last_active_workspace: Option<WeakEntity<Workspace>>,
 }
 
+/// The root view of a Zed window: owns every [`Workspace`] displayed in that
+/// window and decides which one is currently presented.
+///
+/// # Model: N workspaces per project group
+///
+/// There is **not** one workspace per worktree. A window holds N workspaces,
+/// each with its own independent [`Project`] (and therefore its own worktrees,
+/// buffers, panes, and database row). Workspaces are *grouped* — not deduped —
+/// by [`ProjectGroupKey`], which is derived from a project's **main**
+/// worktree path list plus its optional remote host
+/// ([`RemoteConnectionOptions`]). Several workspaces whose projects resolve
+/// to the same main-worktree paths and host (for example, the main checkout
+/// and agent threads running in linked git worktrees of the same repository)
+/// share a single project group and are rendered together under one project
+/// header in the sidebar. Conversely, the same path list on two different
+/// hosts (local vs. SSH) yields two distinct groups.
+///
+/// # Group lifecycle
+///
+/// `project_groups` is an ordered list of [`ProjectGroupState`]; the order is
+/// the sidebar order and the cycling order for `NextProject` /
+/// `PreviousProject`. Groups are created lazily by
+/// [`Self::ensure_project_group_state`] whenever a workspace with an unseen
+/// key is retained. When a project's worktree set changes, the project emits
+/// `WorktreePathsChanged` and [`Self::rekey_project_group`] moves the group
+/// from the old key to the new one in place (preserving order), resolving
+/// collisions in favor of the active workspace's group. A group can outlive
+/// its workspaces: it then represents a closed project that can be reopened
+/// from the sidebar.
+///
+/// # Active vs. retained workspaces
+///
+/// `retained_workspaces` are the workspaces kept alive in this window;
+/// `active_workspace` is the one currently presented. The active workspace
+/// may be *transient* (not yet retained) until the sidebar is opened or the
+/// user switches away, at which point it is promoted via
+/// [`Self::retain_workspace`].
+///
+/// # Persistence
+///
+/// Per-window state is serialized to the key-value store as
+/// [`MultiWorkspaceState`] (see `persistence/model.rs`): the active
+/// workspace's database id, the ordered project groups (key + expanded
+/// flag), and sidebar state. Individual workspaces serialize their own
+/// contents separately to SQLite; on restore, groups are reconciled with
+/// deserialized workspaces via [`Self::restore_project_groups`].
 pub struct MultiWorkspace {
     window_id: WindowId,
     retained_workspaces: Vec<Entity<Workspace>>,
@@ -969,9 +1041,6 @@ impl MultiWorkspace {
         );
     }
 
-    /// Transitions a project group from `old_key` to `new_key`.
-    ///
-    /// On collision (both keys have groups), the active workspace's
     /// Re-keys a project group from `old_key` to `new_key`, handling
     /// collisions. When two groups collide, the active workspace's
     /// group always wins. Otherwise the old key's state is preserved

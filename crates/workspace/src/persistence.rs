@@ -126,8 +126,8 @@ impl Bind for PaneKind {
 
 impl Column for PaneKind {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
-        String::column(statement, start_index).and_then(|(kind, next_index)| {
-            Ok((
+        String::column(statement, start_index).map(|(kind, next_index)| {
+            (
                 match kind.as_str() {
                     "tabs" => Self::Tabs,
                     "project" => Self::Project,
@@ -135,7 +135,7 @@ impl Column for PaneKind {
                     _ => Self::Tabs,
                 },
                 next_index,
-            ))
+            )
         })
     }
 }
@@ -1746,6 +1746,14 @@ impl WorkspaceDb {
                 host = Some(format!("mock-{}", id));
                 user = Some(format!("mock-user-{}", id));
             }
+            // The `Mock` identity only exists when the `remote` crate is
+            // built with test-support. Feature unification (e.g. `cargo
+            // clippy --all-targets`) can enable it for the non-test lib
+            // build, where the cfg'd arm above is compiled out, so a
+            // wildcard is needed for the match to stay exhaustive in every
+            // feature combination.
+            #[allow(unreachable_patterns)]
+            other => anyhow::bail!("unsupported remote connection identity: {other:?}"),
         }
 
         if let RemoteConnectionOptions::Docker(options) = options {
