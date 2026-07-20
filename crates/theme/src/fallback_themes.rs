@@ -131,7 +131,7 @@ pub(crate) fn zed_default_dark() -> Theme {
                 element_disabled: SystemColors::default().transparent,
                 element_selection_background: player.local().selection.alpha(0.25),
                 drop_target_background: hsla(220.0 / 360., 8.3 / 100., 21.4 / 100., 1.0),
-                drop_target_border: hsla(206. / 360., 100. / 100., 50. / 100., 1.0),
+                drop_target_border: hsla(206. / 360., 1.0, 50. / 100., 1.0),
                 ghost_element_background: SystemColors::default().transparent,
                 ghost_element_hover: hover,
                 ghost_element_active: hsla(220.0 / 360., 11.8 / 100., 20.0 / 100., 1.0),

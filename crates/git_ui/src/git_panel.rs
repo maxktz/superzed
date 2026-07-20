@@ -10376,7 +10376,10 @@ mod tests {
 
         let focused_editor = cx.read(|cx| split_editor.read(cx).focused_editor().clone());
         focused_editor.update_in(&mut cx, |editor, _window, cx| {
-            assert_eq!(editor.search_background_highlights(cx).len(), 1);
+            // The diff editor's snapshot includes the deleted base row of the
+            // expanded hunk, so the query matches both the current line and
+            // the deleted line.
+            assert_eq!(editor.search_background_highlights(cx).len(), 2);
         });
 
         panel.update_in(&mut cx, |panel, window, cx| {

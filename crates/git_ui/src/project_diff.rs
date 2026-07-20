@@ -362,6 +362,54 @@ impl ProjectDiff {
     }
 }
 
+/// Computes the canonical "uncommitted diffstat" for a repository: the sum of
+/// `BufferDiff::changed_row_counts` over every buffer with uncommitted
+/// changes (including untracked and deleted files).
+///
+/// This is the same per-buffer quantity that the Uncommitted Diff view's
+/// multibuffer sums in [`ProjectDiff::calculate_changed_lines`], so consumers
+/// that need +added/-removed counts without opening the diff view (for
+/// example, a per-project diffstat in a sidebar) always agree with the
+/// numbers shown in the Uncommitted Diff tab's toolbar.
+pub fn uncommitted_changed_lines(
+    project: &Entity<Project>,
+    repo: &Entity<Repository>,
+    cx: &mut App,
+) -> Task<Result<(u32, u32)>> {
+    let changed_paths: Vec<ProjectPath> = {
+        let repo = repo.read(cx);
+        repo.cached_status()
+            .filter(|entry| entry.status.has_changes())
+            .filter_map(|entry| repo.repo_path_to_project_path(&entry.repo_path, cx))
+            .collect()
+    };
+    let diff_tasks: Vec<_> = changed_paths
+        .into_iter()
+        .map(|project_path| {
+            project.update(cx, |project, cx| {
+                let buffer_task = project.open_buffer(project_path, cx);
+                cx.spawn(async move |project, cx| {
+                    let buffer = buffer_task.await?;
+                    let diff = project
+                        .update(cx, |project, cx| project.open_uncommitted_diff(buffer, cx))?
+                        .await?;
+                    anyhow::Ok(cx.update(|cx| diff.read(cx).changed_row_counts()))
+                })
+            })
+        })
+        .collect();
+    cx.spawn(async move |_| {
+        let mut added_rows = 0;
+        let mut removed_rows = 0;
+        for diff_task in diff_tasks {
+            let (added, removed) = diff_task.await?;
+            added_rows += added;
+            removed_rows += removed;
+        }
+        Ok((added_rows, removed_rows))
+    })
+}
+
 struct ButtonStates {
     stage: bool,
     unstage: bool,
@@ -1127,6 +1175,175 @@ mod tests {
         let mut cx = EditorTestContext::for_editor_in(editor, cx).await;
 
         cx.assert_excerpts_with_selections("[EXCERPT]\nˇ# My cool project\nDetails to come.\n");
+    }
+
+    #[gpui::test]
+    async fn test_uncommitted_diff_tab_reflects_working_tree_edits(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "file.txt": "one\nTWO\nthree\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("file.txt", "one\ntwo\nthree\n".to_owned())],
+        );
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+
+        // Open a regular editor tab for the active file, then deploy the
+        // Uncommitted Diff tab. Both items must coexist in the workspace.
+        let _editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_path((worktree_id, rel_path("file.txt")), None, true, window, cx)
+            })
+            .await
+            .unwrap()
+            .downcast::<Editor>()
+            .unwrap();
+
+        cx.focus(&workspace);
+        cx.update(|window, cx| {
+            window.dispatch_action(project_diff::Diff.boxed_clone(), cx);
+        });
+        cx.run_until_parked();
+
+        let diff_item = workspace.update(cx, |workspace, cx| {
+            let diff_item = workspace.active_item_as::<ProjectDiff>(cx).unwrap();
+            assert!(
+                workspace.items_of_type::<Editor>(cx).next().is_some(),
+                "the editor tab should still be open alongside the diff tab"
+            );
+            diff_item
+        });
+        assert_eq!(
+            diff_item.read_with(cx, |diff_item, cx| diff_item.tab_content_text(0, cx)),
+            "Uncommitted Diff"
+        );
+        assert_eq!(
+            diff_item.read_with(cx, |diff_item, cx| diff_item.excerpt_file_paths(cx)),
+            vec!["file.txt"]
+        );
+
+        let diff_editor = diff_item.read_with(cx, |diff_item, cx| {
+            diff_item.editor(cx).read(cx).rhs_editor().clone()
+        });
+        assert_state_with_diff(
+            &diff_editor,
+            cx,
+            &"
+                  ˇone
+                - two
+                + TWO
+                  three
+            "
+            .unindent(),
+        );
+        assert_eq!(
+            diff_item.read_with(cx, |diff_item, cx| diff_item.calculate_changed_lines(cx)),
+            (1, 1)
+        );
+
+        // Edit the working tree; the resulting status change must refresh the
+        // already-open diff view.
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/project/file.txt"), cx)
+            })
+            .await
+            .unwrap();
+        buffer.update(cx, |buffer, cx| {
+            let end = buffer.len();
+            buffer.edit([(end..end, "four\n")], None, cx);
+        });
+        project
+            .update(cx, |project, cx| project.save_buffer(buffer, cx))
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        assert_state_with_diff(
+            &diff_editor,
+            cx,
+            &"
+                  ˇone
+                - two
+                + TWO
+                  three
+                + four
+            "
+            .unindent(),
+        );
+        assert_eq!(
+            diff_item.read_with(cx, |diff_item, cx| diff_item.calculate_changed_lines(cx)),
+            (2, 1)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_calculate_changed_lines_matches_uncommitted_diffstat(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        // a.txt: one line changed, two lines added (+3/-1).
+        // b.txt: untracked, two lines added (+2/-0).
+        // c.txt: deleted, three lines removed (+0/-3).
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "one\nTWO\nthree\nfour\nfive\n",
+                "b.txt": "x\ny\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            Path::new(path!("/project/.git")),
+            &[
+                ("a.txt", "one\ntwo\nthree\n".to_owned()),
+                ("c.txt", "p\nq\nr\n".to_owned()),
+            ],
+        );
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        cx.run_until_parked();
+
+        cx.focus(&workspace);
+        cx.update(|window, cx| {
+            window.dispatch_action(project_diff::Diff.boxed_clone(), cx);
+        });
+        cx.run_until_parked();
+
+        let diff_item = workspace.update(cx, |workspace, cx| {
+            workspace.active_item_as::<ProjectDiff>(cx).unwrap()
+        });
+        let view_counts =
+            diff_item.read_with(cx, |diff_item, cx| diff_item.calculate_changed_lines(cx));
+        assert_eq!(view_counts, (5, 4));
+
+        // The canonical diffstat helper must agree with the diff view.
+        let repo = project
+            .read_with(cx, |project, cx| project.active_repository(cx))
+            .unwrap();
+        let canonical_counts = cx
+            .update(|_window, cx| uncommitted_changed_lines(&project, &repo, cx))
+            .await
+            .unwrap();
+        assert_eq!(canonical_counts, view_counts);
     }
 
     #[gpui::test]
