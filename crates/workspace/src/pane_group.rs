@@ -132,7 +132,11 @@ impl PaneGroup {
                     );
                 }
                 Member::Axis(axis) => {
-                    let _ = axis.split(&first_pane, new_pane, direction, size_hint, cx);
+                    if !axis.split(&first_pane, new_pane, direction, size_hint, cx) {
+                        log::error!(
+                            "failed to split fallback pane: first pane not found in pane tree"
+                        );
+                    }
                 }
             }
         }

@@ -2333,6 +2333,10 @@ impl Workspace {
         match position {
             DockPosition::Left => &self.left_dock,
             DockPosition::Right => &self.right_dock,
+            // This fork has no bottom dock. Panels requesting Bottom (e.g. the
+            // terminal panel's default position) are remapped to the right
+            // dock everywhere: here, in `valid_panel_dock_position`, and in
+            // the panel position observer in `dock.rs`.
             DockPosition::Bottom => &self.right_dock,
         }
     }
@@ -2343,10 +2347,13 @@ impl Workspace {
         window: &Window,
         cx: &App,
     ) -> DockPosition {
-        let requested_position = panel.position(window, cx);
-        if requested_position != DockPosition::Bottom
-            && panel.position_is_valid(requested_position, cx)
-        {
+        // Bottom always remaps to Right, matching `dock_at_position` and the
+        // position observer in `dock.rs`.
+        let requested_position = match panel.position(window, cx) {
+            DockPosition::Bottom => DockPosition::Right,
+            position => position,
+        };
+        if panel.position_is_valid(requested_position, cx) {
             requested_position
         } else if panel.position_is_valid(DockPosition::Left, cx) {
             DockPosition::Left
@@ -8677,6 +8684,95 @@ impl Workspace {
         cx.notify();
     }
 
+    fn render_dock(
+        &self,
+        position: DockPosition,
+        dock: &Entity<Dock>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Div> {
+        // Panels with a hosted pane kind (project/agent) render as pane items
+        // in the center, so docks that only contain hosted panels are never
+        // rendered. Panels without a hosted pane kind still live exclusively
+        // in the docks; render the dock for them so their focus handles stay
+        // mounted — otherwise focus_panel/toggle_panel_focus cannot transfer
+        // focus to the panel (the window drops focus from unrendered
+        // elements on the next frame).
+        let has_unhosted_panel = dock
+            .read(cx)
+            .panel_handles()
+            .iter()
+            .any(|panel| PanelPaneKind::for_panel_key(panel.panel_key()).is_none());
+        if !has_unhosted_panel {
+            return None;
+        }
+
+        if let Some(visible_panel) = dock.read(cx).visible_panel()
+            && PanelPaneKind::for_panel_key(visible_panel.panel_key()).is_some()
+        {
+            // The visible panel already renders as a hosted pane item;
+            // rendering the dock too would mount the same view twice.
+            return None;
+        }
+
+        if self.zoomed_position == Some(position) {
+            return None;
+        }
+
+        let mut container = div()
+            .flex()
+            .overflow_hidden()
+            .flex_none()
+            .child(dock.clone());
+
+        // Apply sizing only when the dock is open. When closed the dock is still
+        // included in the element tree so its focus handle remains mounted — without
+        // this, toggle_panel_focus cannot focus the panel when the dock is closed.
+        let dock = dock.read(cx);
+        if let Some(panel) = dock.visible_panel() {
+            let size_state = dock.stored_panel_size_state(panel.as_ref());
+            let min_size = panel.min_size(window, cx);
+            if position.axis() == Axis::Horizontal {
+                let use_flexible = panel.has_flexible_size(window, cx);
+                let flex_grow = if use_flexible {
+                    size_state
+                        .and_then(|state| state.flex)
+                        .or_else(|| self.default_dock_flex(position))
+                } else {
+                    None
+                };
+                if let Some(grow) = flex_grow {
+                    let grow = (grow / self.center_full_height_column_count()).max(0.001);
+                    let style = container.style();
+                    style.flex_grow = Some(grow);
+                    style.flex_shrink = Some(1.0);
+                    style.flex_basis = Some(relative(0.).into());
+                } else {
+                    let size = size_state
+                        .and_then(|state| state.size)
+                        .unwrap_or_else(|| panel.default_size(window, cx));
+                    container = container.w(size);
+                    // Allow the fixed-width dock to shrink when there isn't
+                    // enough space (e.g. when the sidebar is open). The
+                    // stored size is preserved so the dock expands back
+                    // when space becomes available.
+                    let style = container.style();
+                    style.flex_shrink = Some(1.0);
+                }
+                if let Some(min) = min_size {
+                    container = container.min_w(min);
+                }
+            } else {
+                let size = size_state
+                    .and_then(|state| state.size)
+                    .unwrap_or_else(|| panel.default_size(window, cx));
+                container = container.h(size);
+            }
+        }
+
+        Some(container)
+    }
+
     /// Renders the center pane group wrapped in a `Main` landmark so assistive
     /// technology recognizes the editor as the main region and can navigate to
     /// it. While a screen reader is active the wrapper is also the focus target
@@ -9431,20 +9527,38 @@ impl Render for Workspace {
                                 ))
                             })
                             .child(
-                                div().flex().flex_row().h_full().child(
-                                    h_flex()
-                                        .flex_1()
-                                        .overflow_hidden()
-                                        .when_some(paddings.0, |this, p| this.child(p.border_r_1()))
-                                        .child(self.render_center(
-                                            &pane_render_context,
-                                            window,
-                                            cx,
-                                        ))
-                                        .when_some(paddings.1, |this, p| {
-                                            this.child(p.border_l_1())
-                                        }),
-                                ),
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .h_full()
+                                    .children(self.render_dock(
+                                        DockPosition::Left,
+                                        &self.left_dock,
+                                        window,
+                                        cx,
+                                    ))
+                                    .child(
+                                        h_flex()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .when_some(paddings.0, |this, p| {
+                                                this.child(p.border_r_1())
+                                            })
+                                            .child(self.render_center(
+                                                &pane_render_context,
+                                                window,
+                                                cx,
+                                            ))
+                                            .when_some(paddings.1, |this, p| {
+                                                this.child(p.border_l_1())
+                                            }),
+                                    )
+                                    .children(self.render_dock(
+                                        DockPosition::Right,
+                                        &self.right_dock,
+                                        window,
+                                        cx,
+                                    )),
                             )
                             .children(self.zoomed.as_ref().and_then(|view| {
                                 let zoomed_view = view.upgrade()?;
@@ -14134,6 +14248,12 @@ mod tests {
 
             let center_column_count = workspace.center.full_height_column_count();
             assert_eq!(center_column_count, 2);
+
+            // Redraws between update blocks sync `bounds` back to the actual
+            // rendered size (which is smaller than the window now that the
+            // workspace renders inside the multi-workspace chrome), so pin the
+            // width again for a deterministic dock size calculation.
+            workspace.bounds.size.width = px(1920.);
 
             let dock = workspace.right_dock().read(cx);
             assert_eq!(workspace.dock_size(&dock, window, cx).unwrap(), px(640.));
