@@ -4456,7 +4456,7 @@ pub(crate) mod tests {
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::Arc;
-    use workspace::{Item, MultiWorkspace};
+    use workspace::{Item, MultiWorkspace, Panel as _};
 
     use crate::agent_panel;
     use crate::completion_provider::AgentContextSource;
@@ -6033,6 +6033,19 @@ pub(crate) mod tests {
             let panel = cx.new(|cx| crate::AgentPanel::new(workspace, window, cx));
             workspace.add_panel(panel.clone(), window, cx);
             workspace.focus_panel::<crate::AgentPanel>(window, cx);
+            // `focus_panel` activates the panel's pane item rather than its
+            // dock; open the dock explicitly since this test asserts on
+            // dock-based visibility.
+            let dock_position = panel.read(cx).position(window, cx);
+            workspace
+                .dock_at_position(dock_position)
+                .clone()
+                .update(cx, |dock, cx| {
+                    if let Some(panel_ix) = dock.panel_index_for_type::<crate::AgentPanel>() {
+                        dock.activate_panel(panel_ix, window, cx);
+                    }
+                    dock.set_open(true, window, cx);
+                });
             panel
         });
 
@@ -6293,6 +6306,14 @@ pub(crate) mod tests {
         let cx = &mut VisualTestContext::from_window(multi_workspace_handle.into(), cx);
         register_test_sidebar(true, cx);
 
+        // The sidebar starts open by default (`sidebar.starts_open`); this
+        // test needs it closed initially so the thread is not visible.
+        multi_workspace_handle
+            .update(cx, |mw, window, cx| {
+                mw.close_sidebar(window, cx);
+            })
+            .unwrap();
+
         let thread_store = cx.update(|_window, cx| cx.new(|cx| ThreadStore::new(cx)));
         let connection_store =
             cx.update(|_window, cx| cx.new(|cx| AgentConnectionStore::new(project.clone(), cx)));
@@ -6389,8 +6410,21 @@ pub(crate) mod tests {
             let panel = cx.new(|cx| crate::AgentPanel::new(workspace, window, cx));
             workspace.add_panel(panel.clone(), window, cx);
 
-            // Open the dock and activate the agent panel so it's visible
+            // Open the dock and activate the agent panel so it's visible.
+            // `focus_panel` activates the panel's pane item rather than its
+            // dock, so open the dock explicitly since this test asserts on
+            // dock-based visibility.
             workspace.focus_panel::<crate::AgentPanel>(window, cx);
+            let dock_position = panel.read(cx).position(window, cx);
+            workspace
+                .dock_at_position(dock_position)
+                .clone()
+                .update(cx, |dock, cx| {
+                    if let Some(panel_ix) = dock.panel_index_for_type::<crate::AgentPanel>() {
+                        dock.activate_panel(panel_ix, window, cx);
+                    }
+                    dock.set_open(true, window, cx);
+                });
             panel
         });
 
@@ -7426,12 +7460,12 @@ pub(crate) mod tests {
             _params: acp::PromptRequest,
             _cx: &mut App,
         ) -> Task<gpui::Result<acp::PromptResponse>> {
-            unimplemented!()
+            Task::ready(Err(anyhow::anyhow!(
+                "prompt is not supported by AuthGatedAgentConnection"
+            )))
         }
 
-        fn cancel(&self, _session_id: &acp::SessionId, _cx: &mut App) {
-            unimplemented!()
-        }
+        fn cancel(&self, _session_id: &acp::SessionId, _cx: &mut App) {}
 
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
@@ -7487,7 +7521,9 @@ pub(crate) mod tests {
             _method_id: acp::AuthMethodId,
             _cx: &mut App,
         ) -> Task<gpui::Result<()>> {
-            unimplemented!()
+            Task::ready(Err(anyhow::anyhow!(
+                "RefusalAgentConnection has no auth methods"
+            )))
         }
 
         fn prompt(
@@ -7498,9 +7534,7 @@ pub(crate) mod tests {
             Task::ready(Ok(acp::PromptResponse::new(acp::StopReason::Refusal)))
         }
 
-        fn cancel(&self, _session_id: &acp::SessionId, _cx: &mut App) {
-            unimplemented!()
-        }
+        fn cancel(&self, _session_id: &acp::SessionId, _cx: &mut App) {}
 
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self

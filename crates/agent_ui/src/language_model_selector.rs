@@ -650,7 +650,9 @@ mod tests {
                 LanguageModelCompletionError,
             >,
         > {
-            unimplemented!()
+            Box::pin(std::future::ready(Err(LanguageModelCompletionError::Other(
+                anyhow::anyhow!("TestLanguageModel does not support streaming completions"),
+            ))))
         }
     }
 

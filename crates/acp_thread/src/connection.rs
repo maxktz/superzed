@@ -973,7 +973,9 @@ mod test_support {
             _method_id: acp::AuthMethodId,
             _cx: &mut App,
         ) -> Task<gpui::Result<()>> {
-            unimplemented!()
+            Task::ready(Err(anyhow::anyhow!(
+                "StubAgentConnection has no auth methods"
+            )))
         }
 
         fn prompt(

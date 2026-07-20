@@ -42,7 +42,9 @@ use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
     terminal_title_without_prefix,
 };
-use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore, ThreadMetadataStoreEvent};
+use crate::thread_metadata_store::{
+    ThreadId, ThreadMetadata, ThreadMetadataStore, ThreadMetadataStoreEvent, WorktreePaths,
+};
 use crate::{
     Agent, AgentInitialContent, AgentThreadSource, ExternalSourcePrompt, NewExternalAgentThread,
     NewNativeAgentThreadFromSummary,
@@ -107,6 +109,12 @@ const LAST_USED_AGENT_KEY: &str = "agent_panel__last_used_external_agent";
 const LAST_CREATED_ENTRY_KIND_KEY: &str = "agent_panel__last_created_entry_kind";
 const TERMINAL_AGENT_TELEMETRY_ID: &str = "terminal";
 const TERMINAL_INIT_COMMAND_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+// The pty's working directory is refreshed on a background thread after each
+// wakeup, so the value visible while handling that wakeup can be one change
+// behind. Re-check shortly after output settles so the final cwd is persisted
+// even when the shell produces no further output.
+const TERMINAL_METADATA_RECHECK_DEBOUNCE: Duration = Duration::from_millis(500);
 const KNOWN_TERMINAL_AGENT_COMMANDS: &[&str] = &[
     "agent", // Unfortunately, both Cursor cli + grok
     "agy",
@@ -1013,6 +1021,7 @@ struct AgentTerminal {
     search_bar: Option<Entity<BufferSearchBar>>,
     notification_windows: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: Vec<Subscription>,
+    metadata_recheck_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1078,7 +1087,12 @@ impl AgentTerminal {
     }
 
     fn refresh_metadata(&mut self, cx: &mut App) -> bool {
+        let previous_terminal_title = self.last_known_terminal_title.clone();
         let title_changed = self.refresh_title(cx);
+        // The composed title can stay the same while the underlying shell
+        // title changes (e.g. a custom title masks it); the raw title is
+        // persisted too, so treat that as a change.
+        let raw_title_changed = self.last_known_terminal_title != previous_terminal_title;
         let current_working_directory = self.view.read(cx).terminal().read(cx).working_directory();
         let working_directory_changed = current_working_directory
             .as_ref()
@@ -1086,7 +1100,7 @@ impl AgentTerminal {
         if working_directory_changed {
             self.working_directory = current_working_directory;
         }
-        title_changed || working_directory_changed
+        title_changed || raw_title_changed || working_directory_changed
     }
 
     fn custom_title(&self, cx: &App) -> Option<SharedString> {
@@ -1718,8 +1732,47 @@ impl AgentPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let thread = self.create_agent_thread_with_server_for_external_session(
-            agent, None, session_id, work_dirs, title, None, source, window, cx,
+        // Share-link and clipboard imports arrive with only an ACP session
+        // id. Mint a ThreadId and seed a metadata row so the thread routes
+        // through the normal thread-id resume path, and so the sidebar can
+        // resolve the session on subsequent opens.
+        let thread_id = ThreadId::new();
+        if let Some(store) = ThreadMetadataStore::try_global(cx) {
+            let now = Utc::now();
+            let worktree_paths = work_dirs
+                .as_ref()
+                .map(WorktreePaths::from_folder_paths)
+                .unwrap_or_default();
+            store.update(cx, |store, cx| {
+                store.save(
+                    ThreadMetadata {
+                        thread_id,
+                        session_id: Some(session_id),
+                        agent_id: agent.id(),
+                        title: title.clone(),
+                        title_override: None,
+                        updated_at: now,
+                        created_at: Some(now),
+                        interacted_at: None,
+                        worktree_paths,
+                        remote_connection: None,
+                        archived: false,
+                    },
+                    cx,
+                );
+            });
+        }
+        let thread = self.create_agent_thread_with_server(
+            agent,
+            None,
+            Some(thread_id),
+            work_dirs,
+            title,
+            None,
+            None,
+            source,
+            window,
+            cx,
         );
         self.set_base_view(thread.into(), focus, window, cx);
     }
@@ -2205,6 +2258,7 @@ impl AgentPanel {
                 | TerminalEvent::BreadcrumbsChanged => {
                     this.refresh_terminal_metadata(terminal_id, cx);
                     this.report_terminal_program(terminal_id, source, cx);
+                    this.schedule_terminal_metadata_recheck(terminal_id, cx);
                 }
                 TerminalEvent::Bell => this.mark_terminal_notification(terminal_id, window, cx),
                 TerminalEvent::CloseTerminal => {
@@ -2234,6 +2288,7 @@ impl AgentPanel {
             search_bar: None,
             notification_windows: Vec::new(),
             notification_subscriptions: Vec::new(),
+            metadata_recheck_task: None,
             _subscriptions: vec![view_subscription, terminal_subscription],
         };
         if self.pending_terminal_spawn == Some(terminal_id) {
@@ -2362,6 +2417,28 @@ impl AgentPanel {
             cx.emit(AgentPanelEvent::EntryChanged);
             cx.notify();
         }
+    }
+
+    fn schedule_terminal_metadata_recheck(
+        &mut self,
+        terminal_id: TerminalId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        terminal.metadata_recheck_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(TERMINAL_METADATA_RECHECK_DEBOUNCE)
+                .await;
+            this.update(cx, |this, cx| {
+                if let Some(terminal) = this.terminals.get_mut(&terminal_id) {
+                    terminal.metadata_recheck_task = None;
+                }
+                this.refresh_terminal_metadata(terminal_id, cx);
+            })
+            .ok();
+        }));
     }
 
     fn report_terminal_program(
@@ -4472,41 +4549,6 @@ impl AgentPanel {
             title,
             initial_content,
             model_override,
-            source,
-            window,
-            cx,
-        )
-    }
-
-    /// Legacy entry that resumes a thread by raw ACP session id when no
-    /// local [`ThreadMetadata`] row exists yet (share-link imports and
-    /// clipboard imports).
-    ///
-    /// TODO(legacy-session-id): migrate remaining callers (share-link
-    /// handler, clipboard import) to mint a [`ThreadId`] + seed metadata
-    /// so they can route through [`create_agent_thread_with_server`] and
-    /// this entry can be deleted.
-    fn create_agent_thread_with_server_for_external_session(
-        &mut self,
-        agent: Agent,
-        server_override: Option<Rc<dyn AgentServer>>,
-        resume_session_id: acp::SessionId,
-        work_dirs: Option<PathList>,
-        title: Option<SharedString>,
-        initial_content: Option<AgentInitialContent>,
-        source: AgentThreadSource,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AgentThread {
-        self.create_agent_thread_inner(
-            agent,
-            server_override,
-            None,
-            Some(resume_session_id),
-            work_dirs,
-            title,
-            initial_content,
-            None,
             source,
             window,
             cx,
@@ -8404,6 +8446,7 @@ mod tests {
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
         let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
 
         let multi_workspace =
@@ -9491,6 +9534,236 @@ mod tests {
                     .is_none(),
                 "terminal metadata should be deleted by the fallback close"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_terminal_custom_title_rename_persists_to_metadata_store(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| {
+            TerminalThreadMetadataStore::init_global(cx);
+        });
+
+        let terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Dev Server", true, window, cx)
+            })
+            .expect("test terminal should be inserted");
+        cx.run_until_parked();
+
+        let terminal_view = panel.read_with(&cx, |panel, _cx| {
+            panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should exist")
+                .view
+                .clone()
+        });
+        terminal_view.update(&mut cx, |terminal_view, cx| {
+            terminal_view.set_custom_title(Some("Fix bug".to_string()), cx);
+        });
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let entry = store
+                .read(cx)
+                .entry(terminal_id)
+                .cloned()
+                .expect("terminal metadata should exist");
+            assert_eq!(entry.custom_title.as_deref(), Some("Fix bug"));
+        });
+
+        // Simulate a restart: a fresh store must read the rename back from
+        // the database.
+        cx.update(|_, cx| {
+            TerminalThreadMetadataStore::init_global(cx);
+        });
+        let reload = cx.update(|_, cx| {
+            TerminalThreadMetadataStore::global(cx)
+                .read(cx)
+                .reload_task()
+        });
+        reload.await;
+        cx.update(|_, cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let entry = store
+                .read(cx)
+                .entry(terminal_id)
+                .cloned()
+                .expect("rename should survive a reload from the database");
+            assert_eq!(entry.custom_title.as_deref(), Some("Fix bug"));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_close_terminal_removes_metadata_row_from_database(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| {
+            TerminalThreadMetadataStore::init_global(cx);
+        });
+
+        let terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Dev Server", true, window, cx)
+            })
+            .expect("test terminal should be inserted");
+        cx.run_until_parked();
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.close_terminal_without_activating_draft(terminal_id, window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(!panel.has_terminal(terminal_id));
+        });
+
+        // Simulate a restart: a fresh store must not find the deleted row.
+        cx.update(|_, cx| {
+            TerminalThreadMetadataStore::init_global(cx);
+        });
+        let reload = cx.update(|_, cx| {
+            TerminalThreadMetadataStore::global(cx)
+                .read(cx)
+                .reload_task()
+        });
+        reload.await;
+        cx.update(|_, cx| {
+            assert!(
+                TerminalThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(terminal_id)
+                    .is_none(),
+                "closing a terminal must delete its database row"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_restores_multiple_terminals_for_same_worktree_in_created_at_order(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| {
+            TerminalThreadMetadataStore::init_global(cx);
+        });
+
+        let folder_paths = PathList::new(&[Path::new("/project")]);
+        let worktree_paths = WorktreePaths::from_folder_paths(&folder_paths);
+        let base = Utc::now();
+        let older = TerminalThreadMetadata {
+            terminal_id: TerminalId::new(),
+            title: "older".into(),
+            custom_title: None,
+            created_at: base - chrono::Duration::seconds(60),
+            worktree_paths: worktree_paths.clone(),
+            remote_connection: None,
+            working_directory: None,
+        };
+        let newer = TerminalThreadMetadata {
+            terminal_id: TerminalId::new(),
+            title: "newer".into(),
+            custom_title: None,
+            created_at: base,
+            worktree_paths,
+            remote_connection: None,
+            working_directory: None,
+        };
+        assert_ne!(older.terminal_id, newer.terminal_id);
+
+        // Save the newest first: restore order must come from `created_at`,
+        // not from insertion order.
+        cx.update(|_, cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(newer.clone(), cx);
+                store.save(older.clone(), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let ordered = cx.update(|_, cx| {
+            TerminalThreadMetadataStore::global(cx)
+                .read(cx)
+                .entries_for_path(&folder_paths, None)
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|metadata| metadata.terminal_id)
+                .collect::<Vec<_>>(),
+            vec![older.terminal_id, newer.terminal_id]
+        );
+
+        panel.update_in(&mut cx, |panel, window, cx| {
+            for metadata in ordered {
+                panel.restore_terminal_for_panel_load(
+                    metadata,
+                    false,
+                    AgentThreadSource::AgentPanel,
+                    None,
+                    window,
+                    cx,
+                );
+            }
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, cx| {
+            assert!(panel.has_terminal(older.terminal_id));
+            assert!(panel.has_terminal(newer.terminal_id));
+            assert_eq!(panel.terminals(cx).len(), 2);
+        });
+
+        // Restoring re-persists the terminals; their created_at (and thus
+        // their order) must be preserved.
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let restored_older = store
+                .read(cx)
+                .entry(older.terminal_id)
+                .cloned()
+                .expect("older terminal should still be in the store");
+            assert_eq!(restored_older.created_at, older.created_at);
+            let restored_newer = store
+                .read(cx)
+                .entry(newer.terminal_id)
+                .cloned()
+                .expect("newer terminal should still be in the store");
+            assert_eq!(restored_newer.created_at, newer.created_at);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_terminal_surface_is_panel_focus_target(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        cx.update(|_, cx| {
+            TerminalThreadMetadataStore::init_global(cx);
+        });
+
+        let terminal_id = panel
+            .update_in(&mut cx, |panel, window, cx| {
+                panel.insert_test_terminal("Dev Server", true, window, cx)
+            })
+            .expect("test terminal should be inserted");
+        cx.run_until_parked();
+
+        // Pane navigation (workspace::ActivatePaneLeft/Right and the sidebar
+        // focus cycling) focuses the panel through `Focusable`, so the
+        // panel's focus handle must target the visible terminal surface.
+        panel.read_with(&cx, |panel, cx| {
+            let terminal_view = panel
+                .terminals
+                .get(&terminal_id)
+                .expect("terminal should exist")
+                .view
+                .clone();
+            assert_eq!(panel.focus_handle(cx), terminal_view.focus_handle(cx));
         });
     }
 

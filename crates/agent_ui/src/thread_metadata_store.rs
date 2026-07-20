@@ -95,7 +95,14 @@ pub fn init(cx: &mut App) {
 /// Migrate existing thread metadata from native agent thread store to the new metadata storage.
 /// We skip migrating threads that do not have a project.
 ///
-/// TODO: Remove this after N weeks of shipping the sidebar
+/// Policy (2026-07): keep this migration indefinitely. Users upgrading from
+/// pre-sidebar builds still need it to avoid stranding their existing
+/// threads, it is idempotent (threads whose session id already has a
+/// metadata row are skipped), and it is cheap on every launch once there is
+/// nothing left to migrate. Revisit only if a future release milestone drops
+/// support for upgrading directly from pre-sidebar builds. The reload-await
+/// ordering it depends on is pinned by
+/// `test_migration_awaits_thread_store_reload`.
 fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
     let store = ThreadMetadataStore::global(cx);
     let db = store.read(cx).db.clone();
@@ -2690,13 +2697,13 @@ mod tests {
             let store = ThreadMetadataStore::global(cx).read(cx);
             let entry = store.entry(thread_id).expect("draft metadata row");
             assert!(entry.is_draft(), "still a draft after title update");
-            assert_eq!(
-                entry.title.as_ref().map(|t| t.as_ref()),
-                Some("Draft Thread")
-            );
+            // Draft rows never persist agent-provided titles; the title only
+            // lands in metadata once the draft is promoted.
+            assert_eq!(entry.title, None);
         });
 
-        // Pushing content promotes the draft: session_id is now populated.
+        // Pushing content promotes the draft: session_id is now populated
+        // and the title is persisted.
         thread.update_in(&mut vcx, |thread, _window, cx| {
             thread.push_user_content_block(None, "Hello".into(), cx);
         });
@@ -2705,9 +2712,11 @@ mod tests {
         cx.read(|cx| {
             let store = ThreadMetadataStore::global(cx).read(cx);
             assert_eq!(store.entry_ids().count(), 1);
+            let entry = store.entry(thread_id).expect("promoted metadata row");
+            assert_eq!(entry.session_id.as_ref(), Some(&session_id));
             assert_eq!(
-                store.entry(thread_id).unwrap().session_id.as_ref(),
-                Some(&session_id),
+                entry.title.as_ref().map(|t| t.as_ref()),
+                Some("Draft Thread")
             );
         });
     }
