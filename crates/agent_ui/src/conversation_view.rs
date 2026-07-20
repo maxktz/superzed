@@ -68,7 +68,7 @@ use ui::{
 };
 use util::{
     ResultExt, debug_panic, defer,
-    paths::{PathStyle, PathWithPosition},
+    paths::{PathExt as _, PathStyle, PathWithPosition},
     rel_path::RelPath,
     size::format_file_size,
     time::duration_alt_display,
@@ -414,6 +414,20 @@ impl Conversation {
             .unwrap_or(0)
     }
 
+    /// Returns the first elicitation for `session_id` that is still waiting on
+    /// a response from the user.
+    pub fn pending_elicitation_for_session(
+        &self,
+        session_id: &acp::SessionId,
+        cx: &App,
+    ) -> Option<ElicitationEntryId> {
+        let thread = self.threads.get(session_id)?;
+        let elicitation_id = self.elicitation_requests.get(session_id)?.iter().next()?;
+        let (_, elicitation) = thread.read(cx).elicitation(elicitation_id)?;
+        matches!(elicitation.status, ElicitationStatus::Pending { .. })
+            .then(|| elicitation_id.clone())
+    }
+
     pub fn respond_to_elicitation(
         &mut self,
         session_id: acp::SessionId,
@@ -524,6 +538,35 @@ pub struct StateChange;
 
 impl EventEmitter<StateChange> for ConversationView {}
 
+/// Why a thread is parked waiting on a human.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkedReason {
+    /// A tool call is waiting for the user to authorize it.
+    ToolCallConfirmation,
+    /// The agent asked the user a question (elicitation) and is waiting for an
+    /// answer.
+    Elicitation,
+}
+
+/// The run state of an agent thread. Unlike [`acp_thread::ThreadStatus`], this
+/// makes "the agent is blocked on a human" a first-class state instead of one
+/// inferred from layout or entry contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadRunState {
+    /// The agent is actively working on a turn.
+    Running,
+    /// The agent cannot make progress until a human responds.
+    ParkedOnHuman(ParkedReason),
+    /// No turn is in progress.
+    Idle,
+}
+
+impl ThreadRunState {
+    pub fn is_parked_on_human(&self) -> bool {
+        matches!(self, ThreadRunState::ParkedOnHuman(_))
+    }
+}
+
 fn resolve_outcome_from_selection(
     options: &PermissionOptions,
     selection: Option<&thread_view::PermissionSelection>,
@@ -569,6 +612,9 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::ToolAuthorizationReceived(_)
         | AcpThreadEvent::ElicitationRequested(_)
         | AcpThreadEvent::ElicitationResponded(_)
+        // StatusChanged only fires on turn boundaries; including it keeps
+        // tab/sidebar statuses in sync with every Running <-> Idle transition.
+        | AcpThreadEvent::StatusChanged
         | AcpThreadEvent::Stopped(_)
         | AcpThreadEvent::Error
         | AcpThreadEvent::LoadError(_)
@@ -576,7 +622,6 @@ fn affects_thread_metadata(event: &AcpThreadEvent) -> bool {
         | AcpThreadEvent::WorkingDirectoriesUpdated => true,
         // --
         AcpThreadEvent::EntryUpdated(_)
-        | AcpThreadEvent::StatusChanged
         | AcpThreadEvent::EntriesRemoved(_)
         | AcpThreadEvent::Retry(_)
         | AcpThreadEvent::TokenUsageUpdated
@@ -666,6 +711,97 @@ impl ConversationView {
                 .pending_tool_call(&root_session_id, cx)
                 .is_some()
         })
+    }
+
+    pub fn root_thread_has_pending_elicitation(&self, cx: &App) -> bool {
+        let Some(root_thread) = self.root_thread_view() else {
+            return false;
+        };
+        let root_session_id = root_thread.read(cx).thread.read(cx).session_id().clone();
+        self.as_connected().is_some_and(|connected| {
+            connected
+                .conversation
+                .read(cx)
+                .pending_elicitation_for_session(&root_session_id, cx)
+                .is_some()
+        })
+    }
+
+    /// Single source of truth for the root thread's run state. Considers both
+    /// pending tool-call authorizations and pending elicitations as "parked on
+    /// a human".
+    pub fn root_thread_run_state(&self, cx: &App) -> ThreadRunState {
+        if self.root_thread_has_pending_tool_call(cx) {
+            return ThreadRunState::ParkedOnHuman(ParkedReason::ToolCallConfirmation);
+        }
+        if self.root_thread_has_pending_elicitation(cx) {
+            return ThreadRunState::ParkedOnHuman(ParkedReason::Elicitation);
+        }
+        match self
+            .root_thread(cx)
+            .map(|thread| thread.read(cx).status())
+        {
+            Some(ThreadStatus::Generating) => ThreadRunState::Running,
+            Some(ThreadStatus::Idle) | None => ThreadRunState::Idle,
+        }
+    }
+
+    /// Maps [`Self::root_thread_run_state`] (plus error and server-liveness
+    /// signals) onto the status shown in tabs and the sidebar. Returns `None`
+    /// when no root thread exists.
+    pub fn root_thread_display_status(&self, cx: &App) -> Option<ui::AgentThreadStatus> {
+        let root_thread = self.root_thread(cx)?;
+        let thread = root_thread.read(cx);
+        if !thread.server_alive() {
+            return Some(ui::AgentThreadStatus::Error);
+        }
+        Some(match self.root_thread_run_state(cx) {
+            ThreadRunState::ParkedOnHuman(_) => ui::AgentThreadStatus::WaitingForConfirmation,
+            _ if thread.had_error() => ui::AgentThreadStatus::Error,
+            ThreadRunState::Running => ui::AgentThreadStatus::Running,
+            ThreadRunState::Idle => ui::AgentThreadStatus::Completed,
+        })
+    }
+
+    /// Run states of subagent threads spawned by this conversation, keyed by
+    /// session. Intended as an orchestration hook; the sidebar/tab UI only
+    /// surfaces the root thread's state.
+    pub fn subagent_run_states(&self, cx: &App) -> Vec<(acp::SessionId, ThreadRunState)> {
+        let Some(connected) = self.as_connected() else {
+            return Vec::new();
+        };
+        let conversation = connected.conversation.read(cx);
+        connected
+            .threads
+            .iter()
+            .filter(|(_, thread_view)| {
+                thread_view
+                    .read(cx)
+                    .thread
+                    .read(cx)
+                    .parent_session_id()
+                    .is_some()
+            })
+            .map(|(session_id, thread_view)| {
+                let run_state = if conversation
+                    .pending_tool_call_for_session(session_id, cx)
+                    .is_some()
+                {
+                    ThreadRunState::ParkedOnHuman(ParkedReason::ToolCallConfirmation)
+                } else if conversation
+                    .pending_elicitation_for_session(session_id, cx)
+                    .is_some()
+                {
+                    ThreadRunState::ParkedOnHuman(ParkedReason::Elicitation)
+                } else {
+                    match thread_view.read(cx).thread.read(cx).status() {
+                        ThreadStatus::Generating => ThreadRunState::Running,
+                        ThreadStatus::Idle => ThreadRunState::Idle,
+                    }
+                };
+                (session_id.clone(), run_state)
+            })
+            .collect()
     }
 
     pub(crate) fn root_thread(&self, cx: &App) -> Option<Entity<AcpThread>> {
@@ -897,8 +1033,8 @@ impl ConversationView {
                 work_dirs,
                 title,
                 project,
-                workspace.clone(),
-                thread_store.clone(),
+                workspace,
+                thread_store,
                 initial_content,
                 source,
                 window,
@@ -1381,9 +1517,9 @@ impl ConversationView {
                 &agent,
                 &connection_key,
                 thread_id,
-                workspace.clone(),
+                workspace,
                 project.downgrade(),
-                thread_store.clone(),
+                thread_store,
                 initial_content.as_ref(),
                 window,
                 cx,
@@ -3537,7 +3673,7 @@ impl ConversationView {
         }
     }
 
-    fn current_model_name(&self, cx: &App) -> SharedString {
+    pub(crate) fn current_model_name(&self, cx: &App) -> SharedString {
         // For native agent (Zed Agent), use the specific model name (e.g., "Claude 3.5 Sonnet")
         // For ACP agents, use the agent name (e.g., "Claude Agent", "Gemini CLI")
         // This provides better clarity about what refused the request
@@ -3551,6 +3687,47 @@ impl ConversationView {
             // ACP agent - use the agent name (e.g., "Claude Agent", "Gemini CLI")
             self.agent.agent_id().0
         }
+    }
+
+    /// The name of the currently selected model, when the agent exposes model
+    /// selection. Unlike [`Self::current_model_name`], never falls back to the
+    /// agent name.
+    pub(crate) fn active_model_name(&self, cx: &App) -> Option<SharedString> {
+        self.root_thread_view()
+            .and_then(|view| view.read(cx).active_model_name(cx))
+    }
+
+    /// The version reported by the connected agent server, when known.
+    pub(crate) fn agent_server_version(&self) -> Option<SharedString> {
+        self.as_connected()
+            .and_then(|connected| connected.connection.agent_version())
+    }
+
+    /// The root thread's primary working directory, shortened with `~` for
+    /// display. Falls back to `None` when the thread has no working
+    /// directories.
+    pub(crate) fn primary_work_dir_display(&self, cx: &App) -> Option<SharedString> {
+        let root_thread = self.root_thread(cx)?;
+        let path = root_thread
+            .read(cx)
+            .work_dirs()?
+            .ordered_paths()
+            .next()?
+            .clone();
+        Some(SharedString::from(
+            path.compact().to_string_lossy().into_owned(),
+        ))
+    }
+
+    /// The root thread's primary working directory as an absolute path.
+    pub(crate) fn primary_work_dir(&self, cx: &App) -> Option<PathBuf> {
+        let root_thread = self.root_thread(cx)?;
+        root_thread
+            .read(cx)
+            .work_dirs()?
+            .ordered_paths()
+            .next()
+            .cloned()
     }
 
     fn create_copy_button(&self, message: impl Into<String>) -> impl IntoElement {
@@ -5497,6 +5674,272 @@ pub(crate) mod tests {
                 .iter()
                 .any(|window| window.downcast::<AgentNotification>().is_some())
         );
+    }
+
+    fn disable_agent_notifications(cx: &mut VisualTestContext) {
+        cx.update(|_window, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    notify_when_agent_waiting: NotifyWhenAgentWaiting::Never,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_root_thread_run_state_tool_call_confirmation(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let tool_call_id = acp::ToolCallId::new("tool-1");
+        let tool_call = acp::ToolCall::new(tool_call_id.clone(), "Label")
+            .kind(acp::ToolKind::Edit)
+            .content(vec!["hi".into()]);
+        let connection =
+            StubAgentConnection::new().with_permission_requests(HashMap::from_iter([(
+                tool_call_id,
+                PermissionOptions::Flat(vec![acp::PermissionOption::new(
+                    "allow",
+                    "Allow",
+                    acp::PermissionOptionKind::AllowOnce,
+                )]),
+            )]));
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::ToolCall(tool_call)]);
+
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        disable_agent_notifications(cx);
+
+        conversation_view.read_with(cx, |view, cx| {
+            assert_eq!(view.root_thread_run_state(cx), ThreadRunState::Idle);
+            assert_eq!(
+                view.root_thread_display_status(cx),
+                Some(ui::AgentThreadStatus::Completed)
+            );
+        });
+
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Hello", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.root_thread_run_state(cx),
+                ThreadRunState::ParkedOnHuman(ParkedReason::ToolCallConfirmation),
+                "a pending tool-call authorization should park the thread on a human"
+            );
+            assert!(view.root_thread_run_state(cx).is_parked_on_human());
+            assert_eq!(
+                view.root_thread_display_status(cx),
+                Some(ui::AgentThreadStatus::WaitingForConfirmation)
+            );
+        });
+
+        let (conversation, session_id) = conversation_view.read_with(cx, |view, cx| {
+            let conversation = view
+                .as_connected()
+                .expect("conversation should be connected")
+                .conversation
+                .clone();
+            let session_id = view
+                .active_thread()
+                .expect("active thread should exist")
+                .read(cx)
+                .session_id
+                .clone();
+            (conversation, session_id)
+        });
+        conversation.update(cx, |conversation, cx| {
+            conversation
+                .authorize_pending_tool_call(&session_id, acp::PermissionOptionKind::AllowOnce, cx)
+                .expect("pending tool call should be authorizable");
+        });
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.root_thread_run_state(cx),
+                ThreadRunState::Idle,
+                "the turn should complete after the tool call is authorized"
+            );
+            assert_eq!(
+                view.root_thread_display_status(cx),
+                Some(ui::AgentThreadStatus::Completed)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_root_thread_run_state_elicitation(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        disable_agent_notifications(cx);
+
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Hello", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.root_thread_run_state(cx),
+                ThreadRunState::Running,
+                "an in-progress turn without pending requests should be Running"
+            );
+            assert_eq!(
+                view.root_thread_display_status(cx),
+                Some(ui::AgentThreadStatus::Running)
+            );
+        });
+
+        let thread = conversation_view.read_with(cx, |view, cx| {
+            view.root_thread(cx).expect("root thread should exist")
+        });
+        let session_id = thread.read_with(cx, |thread, _| thread.session_id().clone());
+        let (elicitation_id, _response_task) = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation_with_id(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationFormMode::new(
+                            acp::ElicitationSessionScope::new(session_id.clone()),
+                            acp::ElicitationSchema::new().string("name", true),
+                        ),
+                        "Provide a name",
+                    ),
+                    cx,
+                )
+                .expect("elicitation request should be accepted")
+        });
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.root_thread_run_state(cx),
+                ThreadRunState::ParkedOnHuman(ParkedReason::Elicitation),
+                "a pending elicitation should park the thread on a human"
+            );
+            assert_eq!(
+                view.root_thread_display_status(cx),
+                Some(ui::AgentThreadStatus::WaitingForConfirmation)
+            );
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &elicitation_id,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
+                    acp::ElicitationAcceptAction::new(),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.root_thread_run_state(cx),
+                ThreadRunState::Running,
+                "answering the elicitation should return the thread to Running"
+            );
+        });
+
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, cx| {
+            assert_eq!(view.root_thread_run_state(cx), ThreadRunState::Idle);
+            assert_eq!(
+                view.root_thread_display_status(cx),
+                Some(ui::AgentThreadStatus::Completed)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_generating_indicator_tracks_status_transitions(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        disable_agent_notifications(cx);
+
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            assert!(!view.generating_indicator_in_list);
+            assert_thread_list_item_count_matches_entries(view, cx);
+        });
+
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Hello", window, cx);
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let session_id = active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            assert!(
+                view.generating_indicator_in_list,
+                "the generating indicator row should be spliced in while generating"
+            );
+            assert_thread_list_item_count_matches_entries(view, cx);
+            view.thread.read(cx).session_id().clone()
+        });
+
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            assert!(
+                !view.generating_indicator_in_list,
+                "the generating indicator row should be removed once the turn ends"
+            );
+            assert_thread_list_item_count_matches_entries(view, cx);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_root_thread_display_status_dead_server(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Response".into()),
+        )]);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+
+        conversation_view.read_with(cx, |view, cx| {
+            assert_eq!(
+                view.root_thread_display_status(cx),
+                Some(ui::AgentThreadStatus::Completed)
+            );
+        });
+
+        connection.set_server_alive(false);
+
+        conversation_view.read_with(cx, |view, cx| {
+            assert!(
+                !view
+                    .root_thread(cx)
+                    .expect("root thread should exist")
+                    .read(cx)
+                    .server_alive()
+            );
+            assert_eq!(
+                view.root_thread_display_status(cx),
+                Some(ui::AgentThreadStatus::Error),
+                "a dead agent server process should surface as a distinct error status"
+            );
+        });
     }
 
     #[gpui::test]

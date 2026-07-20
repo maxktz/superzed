@@ -27,7 +27,11 @@ use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::{any::Any, cell::RefCell, collections::VecDeque};
+use std::{
+    any::Any,
+    cell::{Cell, RefCell},
+    collections::VecDeque,
+};
 use task::{Shell, ShellBuilder, SpawnInTerminal};
 use thiserror::Error;
 use util::ResultExt as _;
@@ -398,6 +402,7 @@ pub struct AcpConnection {
     request_elicitations: Entity<ElicitationStore>,
     defaults: AcpConnectionDefaults,
     child: Option<Child>,
+    server_exited: Rc<Cell<bool>>,
     session_list: Option<Rc<AcpSessionList>>,
     debug_log: AcpDebugLog,
     _settings_subscription: Subscription,
@@ -1005,10 +1010,13 @@ impl AcpConnection {
             return Err(UnsupportedVersion.into());
         }
 
+        let server_exited = Rc::new(Cell::new(false));
         let wait_task = cx.spawn({
             let sessions = sessions.clone();
+            let server_exited = server_exited.clone();
             async move |cx| {
                 let load_error = status_fut.await?;
+                server_exited.set(true);
                 emit_load_error_to_all_sessions(&sessions, load_error, cx);
                 anyhow::Ok(())
             }
@@ -1083,6 +1091,7 @@ impl AcpConnection {
             agent_capabilities: response.agent_capabilities,
             request_elicitations,
             defaults,
+            server_exited,
             session_list,
             debug_log,
             _settings_subscription: settings_subscription,
@@ -1126,6 +1135,7 @@ impl AcpConnection {
             request_elicitations,
             defaults,
             child: None,
+            server_exited: Rc::new(Cell::new(false)),
             session_list: None,
             debug_log: AcpDebugLog::default(),
             _settings_subscription: settings_subscription,
@@ -1577,6 +1587,10 @@ impl AgentConnection for AcpConnection {
 
     fn agent_version(&self) -> Option<SharedString> {
         self.agent_version.clone()
+    }
+
+    fn server_alive(&self) -> bool {
+        !self.server_exited.get()
     }
 
     fn new_session(
@@ -2178,6 +2192,7 @@ pub mod test_support {
                 let connection = harness.connection.clone();
                 let simulate_exit_task = cx.spawn(async move |cx| {
                     while let Ok(status) = exit_rx.recv().await {
+                        connection.server_exited.set(true);
                         emit_load_error_to_all_sessions(
                             &connection.sessions,
                             LoadError::Exited {
@@ -2227,6 +2242,10 @@ pub mod test_support {
 
         fn agent_version(&self) -> Option<SharedString> {
             self.inner.agent_version()
+        }
+
+        fn server_alive(&self) -> bool {
+            self.inner.server_alive()
         }
 
         fn new_session(
@@ -2695,6 +2714,61 @@ mod tests {
             settings_store.register_setting::<feature_flags::FeatureFlagsSettings>();
             cx.set_global(settings_store);
             cx.update_flags(false, vec![]);
+        });
+    }
+
+
+    #[gpui::test]
+    async fn test_server_alive_reflects_simulated_server_exit(cx: &mut gpui::TestAppContext) {
+        init_feature_flags_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({ "a": {} })).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/a")], cx).await;
+
+        let server = test_support::FakeAcpAgentServer::new();
+        let delegate = crate::AgentServerDelegate::new(
+            project.read_with(cx, |project, _| project.agent_server_store().clone()),
+            None,
+            None,
+        );
+        let connection = cx
+            .update(|cx| crate::AgentServer::connect(&server, delegate, project.clone(), cx))
+            .await
+            .expect("fake ACP server should connect");
+
+        let work_dirs = util::path_list::PathList::new(&[std::path::Path::new("/a")]);
+        let thread = cx
+            .update(|cx| connection.clone().new_session(project, work_dirs, cx))
+            .await
+            .expect("session creation should succeed");
+        cx.run_until_parked();
+
+        assert!(
+            connection.server_alive(),
+            "connection should report alive right after connecting"
+        );
+        thread.read_with(cx, |thread, _| {
+            assert!(
+                thread.server_alive(),
+                "thread should report alive while the server is running"
+            );
+            assert_eq!(thread.server_exit_status(), None);
+        });
+
+        server.simulate_server_exit();
+        cx.run_until_parked();
+
+        assert!(
+            !connection.server_alive(),
+            "connection should report dead after the server process exits"
+        );
+        thread.read_with(cx, |thread, _| {
+            assert!(
+                !thread.server_alive(),
+                "thread should report dead after the server process exits"
+            );
+            assert!(thread.server_exit_status().is_some());
         });
     }
 

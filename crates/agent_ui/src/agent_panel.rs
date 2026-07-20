@@ -6075,6 +6075,44 @@ impl AgentPanel {
                 .into_any_element()
         });
 
+        // "Claude Code 1.2.3 · Claude Fable 5 · ~/dev/paykit" meta line for the
+        // active thread; the tooltip carries the full working directory path.
+        let thread_meta = matches!(mode, ToolbarMode::ActiveThread)
+            .then(|| self.active_conversation_view())
+            .flatten()
+            .map(|conversation_view| {
+                let view = conversation_view.read(cx);
+                let harness = match view.agent_server_version() {
+                    Some(version) => format!("{} {}", selected_agent_label, version),
+                    None => selected_agent_label.to_string(),
+                };
+                let mut parts = vec![harness];
+                if let Some(model) = view.active_model_name(cx) {
+                    parts.push(model.to_string());
+                }
+                let mut tooltip_parts = parts.clone();
+                if let Some(cwd) = view.primary_work_dir_display(cx) {
+                    parts.push(cwd.to_string());
+                }
+                if let Some(cwd) = view.primary_work_dir(cx) {
+                    tooltip_parts.push(cwd.display().to_string());
+                }
+                let tooltip_text = SharedString::from(tooltip_parts.join(" · "));
+                h_flex()
+                    .id("agent-thread-meta")
+                    .min_w_0()
+                    .flex_shrink(1.)
+                    .overflow_hidden()
+                    .tooltip(Tooltip::text(tooltip_text))
+                    .child(
+                        Label::new(parts.join(" · "))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    )
+                    .into_any_element()
+            });
+
         let toolbar_content = {
             let new_thread_menu = PopoverMenu::new("new_thread_menu")
                 .trigger_with_tooltip(
@@ -6116,7 +6154,8 @@ impl AgentPanel {
                         .child(match empty_thread_title {
                             Some(title) => title,
                             None => self.render_title_view(window, cx),
-                        }),
+                        })
+                        .children(thread_meta),
                 )
                 .child(
                     h_flex()

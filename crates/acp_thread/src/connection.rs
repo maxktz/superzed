@@ -97,6 +97,13 @@ pub trait AgentConnection {
         None
     }
 
+    /// Whether the agent server process behind this connection (if any) is
+    /// still running. Connections that are not backed by a subprocess always
+    /// report `true`.
+    fn server_alive(&self) -> bool {
+        true
+    }
+
     fn new_session(
         self: Rc<Self>,
         project: Entity<Project>,
@@ -761,6 +768,7 @@ mod test_support {
         supports_session_additional_directories: bool,
         agent_id: AgentId,
         telemetry_id: SharedString,
+        server_alive: Arc<std::sync::atomic::AtomicBool>,
     }
 
     struct Session {
@@ -784,7 +792,14 @@ mod test_support {
                 supports_session_additional_directories: false,
                 agent_id: AgentId::new("stub"),
                 telemetry_id: "stub".into(),
+                server_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             }
+        }
+
+        /// Simulates the agent server process dying (or coming back) so tests
+        /// can exercise liveness-dependent UI states.
+        pub fn set_server_alive(&self, alive: bool) {
+            self.server_alive.store(alive, Ordering::SeqCst);
         }
 
         pub fn set_next_prompt_updates(&self, updates: Vec<acp::SessionUpdate>) {
@@ -901,6 +916,10 @@ mod test_support {
 
         fn telemetry_id(&self) -> SharedString {
             self.telemetry_id.clone()
+        }
+
+        fn server_alive(&self) -> bool {
+            self.server_alive.load(Ordering::SeqCst)
         }
 
         fn auth_methods(&self) -> &[acp::AuthMethod] {

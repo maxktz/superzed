@@ -283,6 +283,9 @@ impl ThreadsArchiveView {
         let mut current_bucket: Option<TimeBucket> = None;
 
         for session in sessions {
+            // `query` is currently a placeholder constant; keep the filtering
+            // code path for when search gets wired up.
+            #[allow(clippy::const_is_empty)]
             let highlight_positions = if !query.is_empty() {
                 let title = session
                     .title

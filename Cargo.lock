@@ -17006,6 +17006,7 @@ dependencies = [
  "agent_ui",
  "anyhow",
  "async-channel 2.5.0",
+ "call",
  "chrono",
  "client",
  "clock",

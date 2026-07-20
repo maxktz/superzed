@@ -4401,9 +4401,57 @@ impl ThreadView {
                                     .children(draft_agent_selector)
                                     .child(self.render_send_button(cx)),
                             ),
-                    ),
+                    )
+                    .children(self.render_status_footer(cx)),
             )
             .into_any()
+    }
+
+    /// A subtle, single-line "model · cwd · branch" status line rendered at the
+    /// bottom of the conversation footer.
+    fn render_status_footer(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let model = self.active_model_name(cx);
+        let cwd = self
+            .thread
+            .read(cx)
+            .work_dirs()
+            .and_then(|dirs| dirs.ordered_paths().next().cloned());
+        let cwd_display = cwd
+            .as_ref()
+            .map(|path| path.compact().to_string_lossy().into_owned());
+        let cwd_full = cwd.as_ref().map(|path| path.display().to_string());
+        let branch = self.project.upgrade().and_then(|project| {
+            project.read(cx).active_repository(cx).and_then(|repo| {
+                repo.read(cx)
+                    .branch
+                    .as_ref()
+                    .map(|branch| branch.name().to_string())
+            })
+        });
+
+        let parts: Vec<String> = [model.map(|model| model.to_string()), cwd_display, branch]
+            .into_iter()
+            .flatten()
+            .collect();
+        if parts.is_empty() {
+            return None;
+        }
+
+        Some(
+            h_flex()
+                .id("thread-status-footer")
+                .w_full()
+                .min_w_0()
+                .overflow_hidden()
+                .when_some(cwd_full, |this, cwd| this.tooltip(Tooltip::text(cwd)))
+                .child(
+                    Label::new(parts.join(" · "))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .truncate(),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_draft_agent_selector(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -11377,6 +11425,16 @@ impl ThreadView {
             // ACP agent - use the agent name (e.g., "Claude Agent", "Gemini CLI")
             self.agent_id.0.clone()
         }
+    }
+
+    /// The name of the currently selected model, when the agent exposes model
+    /// selection. Unlike [`Self::current_model_name`], never falls back to the
+    /// agent name.
+    pub(crate) fn active_model_name(&self, cx: &App) -> Option<SharedString> {
+        self.model_selector
+            .as_ref()
+            .and_then(|selector| selector.read(cx).active_model(cx))
+            .map(|model| model.name.clone())
     }
 
     fn render_any_thread_error(

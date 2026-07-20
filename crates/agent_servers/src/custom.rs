@@ -227,23 +227,9 @@ impl AgentServer for CustomAgentServer {
             extra_env.insert("NO_BROWSER".to_owned(), "1".to_owned());
         }
         if is_registry_agent {
-            match agent_id.as_ref() {
-                CLAUDE_AGENT_ID => {
-                    extra_env.insert("ANTHROPIC_API_KEY".into(), "".into());
-                }
-                CODEX_ID => {
-                    if let Ok(api_key) = std::env::var("CODEX_API_KEY") {
-                        extra_env.insert("CODEX_API_KEY".into(), api_key);
-                    }
-                    if let Ok(api_key) = std::env::var("OPEN_AI_API_KEY") {
-                        extra_env.insert("OPEN_AI_API_KEY".into(), api_key);
-                    }
-                }
-                GEMINI_ID => {
-                    extra_env.insert("SURFACE".to_owned(), "zed".to_owned());
-                }
-                _ => {}
-            }
+            extra_env.extend(registry_agent_env_overrides(agent_id.as_ref(), &|key| {
+                std::env::var(key).ok()
+            }));
         }
         let store = delegate.store.downgrade();
         cx.spawn(async move |cx| {
@@ -300,6 +286,25 @@ fn api_key_for_gemini_cli(cx: &mut App) -> Task<Result<String>> {
                 .to_string(),
         )
     })
+}
+
+/// Environment overrides Zed injects when launching specific registry-managed
+/// agents. Kept as a pure function (with the process environment abstracted
+/// behind `process_env`) so the per-agent behavior can be unit tested without
+/// spawning a server.
+fn registry_agent_env_overrides(
+    agent_id: &str,
+    process_env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    match agent_id {
+        CLAUDE_AGENT_ID => vec![("ANTHROPIC_API_KEY".to_owned(), String::new())],
+        CODEX_ID => ["CODEX_API_KEY", "OPEN_AI_API_KEY"]
+            .into_iter()
+            .filter_map(|key| Some((key.to_owned(), process_env(key)?)))
+            .collect(),
+        GEMINI_ID => vec![("SURFACE".to_owned(), "zed".to_owned())],
+        _ => Vec::new(),
+    }
 }
 
 fn is_registry_agent(agent_id: impl Into<AgentId>, cx: &App) -> bool {
@@ -389,6 +394,115 @@ mod tests {
                 cx,
             );
         });
+    }
+
+    #[test]
+    fn test_registry_agent_env_overrides_claude() {
+        let overrides = registry_agent_env_overrides(CLAUDE_AGENT_ID, &|_| None);
+        assert_eq!(
+            overrides,
+            vec![("ANTHROPIC_API_KEY".to_owned(), String::new())],
+            "claude-acp should get a blanked ANTHROPIC_API_KEY so login state is used"
+        );
+    }
+
+    #[test]
+    fn test_registry_agent_env_overrides_codex() {
+        let process_env = |key: &str| match key {
+            "CODEX_API_KEY" => Some("codex-key".to_owned()),
+            "OPEN_AI_API_KEY" => Some("openai-key".to_owned()),
+            _ => None,
+        };
+        let overrides = registry_agent_env_overrides(CODEX_ID, &process_env);
+        assert_eq!(
+            overrides,
+            vec![
+                ("CODEX_API_KEY".to_owned(), "codex-key".to_owned()),
+                ("OPEN_AI_API_KEY".to_owned(), "openai-key".to_owned()),
+            ],
+            "codex-acp should forward API keys from the process environment"
+        );
+
+        let overrides = registry_agent_env_overrides(CODEX_ID, &|_| None);
+        assert_eq!(
+            overrides,
+            Vec::new(),
+            "codex-acp should not inject keys that are absent from the process environment"
+        );
+    }
+
+    #[test]
+    fn test_registry_agent_env_overrides_gemini_and_unknown() {
+        assert_eq!(
+            registry_agent_env_overrides(GEMINI_ID, &|_| None),
+            vec![("SURFACE".to_owned(), "zed".to_owned())]
+        );
+        assert_eq!(
+            registry_agent_env_overrides("some-other-agent", &|_| Some("value".to_owned())),
+            Vec::new(),
+            "unknown agents should get no environment overrides"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_custom_agent_settings_round_trip_to_resolved_command(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/root", serde_json::json!({})).await;
+        let project = project::Project::test(fs, [std::path::Path::new("/root")], cx).await;
+
+        set_agent_server_settings(
+            cx,
+            vec![(
+                "my-made-up-agent",
+                settings::CustomAgentServerSettings::Custom {
+                    path: "/bin/my-agent".into(),
+                    args: vec!["--acp".to_owned()],
+                    env: HashMap::from_iter([("FOO".to_owned(), "bar".to_owned())]),
+                    default_mode: None,
+                    default_config_options: HashMap::default(),
+                    favorite_config_option_values: HashMap::default(),
+                },
+            )],
+        );
+        cx.run_until_parked();
+
+        let store = project.read_with(cx, |project, _| project.agent_server_store().clone());
+        let command = store
+            .update(cx, |store, cx| {
+                let agent = store
+                    .get_external_agent(&AgentId::new("my-made-up-agent"))
+                    .expect("custom agent from settings should be registered in the store");
+                agent.get_command(
+                    vec!["--extra-arg".to_owned()],
+                    HashMap::from_iter([("EXTRA".to_owned(), "1".to_owned())]),
+                    &mut cx.to_async(),
+                )
+            })
+            .await
+            .expect("resolving the custom agent command should succeed");
+
+        assert_eq!(command.path, std::path::PathBuf::from("/bin/my-agent"));
+        assert_eq!(
+            command.args,
+            vec!["--acp".to_owned(), "--extra-arg".to_owned()]
+        );
+        let env: HashMap<String, String> = command
+            .env
+            .expect("resolved command should carry an environment")
+            .into_iter()
+            .collect();
+        assert_eq!(
+            env.get("FOO").map(String::as_str),
+            Some("bar"),
+            "settings env should survive the round trip"
+        );
+        assert_eq!(
+            env.get("EXTRA").map(String::as_str),
+            Some("1"),
+            "connect-time extra env should be merged into the resolved command"
+        );
     }
 
     #[gpui::test]

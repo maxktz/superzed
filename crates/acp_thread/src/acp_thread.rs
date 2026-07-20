@@ -2101,6 +2101,9 @@ pub struct AcpThread {
     pending_terminal_output: HashMap<acp::TerminalId, Vec<Vec<u8>>>,
     pending_terminal_exit: HashMap<acp::TerminalId, acp::TerminalExitStatus>,
     had_error: bool,
+    /// Set when the agent server process backing this thread exits, so the UI
+    /// can distinguish "agent is dead" from ordinary errors or idleness.
+    server_exit_status: Option<ExitStatus>,
     /// The user's unsent prompt text, persisted so it can be restored when reloading the thread.
     draft_prompt: Option<Vec<acp::ContentBlock>>,
     /// The initial scroll position for the thread view, set during session registration.
@@ -2314,6 +2317,7 @@ impl AcpThread {
             pending_terminal_output: HashMap::default(),
             pending_terminal_exit: HashMap::default(),
             had_error: false,
+            server_exit_status: None,
             draft_prompt: None,
             ui_scroll_position: None,
             streaming_text_buffer: None,
@@ -2439,6 +2443,16 @@ impl AcpThread {
 
     pub fn had_error(&self) -> bool {
         self.had_error
+    }
+
+    /// Whether the agent server process backing this thread is still alive.
+    /// Threads served in-process (e.g. the native agent) always report `true`.
+    pub fn server_alive(&self) -> bool {
+        self.server_exit_status.is_none() && self.connection.server_alive()
+    }
+
+    pub fn server_exit_status(&self) -> Option<ExitStatus> {
+        self.server_exit_status
     }
 
     pub fn is_waiting_for_confirmation(&self) -> bool {
@@ -4562,6 +4576,9 @@ impl AcpThread {
     }
 
     pub fn emit_load_error(&mut self, error: LoadError, cx: &mut Context<Self>) {
+        if let LoadError::Exited { status, .. } = &error {
+            self.server_exit_status = Some(*status);
+        }
         cx.emit(AcpThreadEvent::LoadError(error));
     }
 
