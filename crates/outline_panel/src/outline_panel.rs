@@ -744,7 +744,7 @@ impl OutlinePanel {
                                     cx,
                                 );
                             }
-                        } else {
+                        } else if !active_item_is_hosted_panel(workspace.read(cx), cx) {
                             outline_panel.clear_previous(window, cx);
                             cx.notify();
                         }
@@ -4913,6 +4913,17 @@ fn workspace_active_editor(
     Some((active_item, active_editor))
 }
 
+// Panels are hosted as pane items, so focusing a panel makes its wrapper item
+// the workspace's active item. Keep showing the outline for the last active
+// editor in that case instead of clearing the panel.
+fn active_item_is_hosted_panel(workspace: &Workspace, cx: &App) -> bool {
+    workspace.active_item(cx).is_some_and(|item| {
+        item.to_any_view()
+            .downcast::<workspace::panel_pane::PanelItem>()
+            .is_ok()
+    })
+}
+
 fn back_to_common_visited_parent(
     visited_dirs: &mut Vec<(ProjectEntryId, Arc<RelPath>)>,
     worktree_id: &WorktreeId,
@@ -5027,7 +5038,11 @@ impl Panel for OutlinePanel {
                             return;
                         }
 
-                        if !outline_panel.pinned {
+                        if !outline_panel.pinned
+                            && !outline_panel.workspace.upgrade().is_some_and(|workspace| {
+                                active_item_is_hosted_panel(workspace.read(cx), cx)
+                            })
+                        {
                             outline_panel.clear_previous(window, cx);
                         }
                     }

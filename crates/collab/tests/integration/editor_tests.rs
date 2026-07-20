@@ -6316,6 +6316,11 @@ async fn test_document_symbols(cx_a: &mut TestAppContext, cx_b: &mut TestAppCont
             store.update_user_settings(cx, |settings| {
                 settings.project.all_languages.defaults.document_symbols =
                     Some(DocumentSymbols::On);
+                settings
+                    .editor
+                    .toolbar
+                    .get_or_insert_default()
+                    .show_breadcrumb_symbols = Some(true);
             });
         });
     });
@@ -6339,6 +6344,11 @@ async fn test_document_symbols(cx_a: &mut TestAppContext, cx_b: &mut TestAppCont
             store.update_user_settings(cx, |settings| {
                 settings.project.all_languages.defaults.document_symbols =
                     Some(DocumentSymbols::On);
+                settings
+                    .editor
+                    .toolbar
+                    .get_or_insert_default()
+                    .show_breadcrumb_symbols = Some(true);
             });
         });
     });

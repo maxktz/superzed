@@ -1137,7 +1137,7 @@ mod tests {
     use session::Session;
     use std::{path::Path, sync::Arc, task::Poll};
     use util::path;
-    use workspace::{AppState, MultiWorkspace};
+    use workspace::{AppState, MultiWorkspace, Workspace};
 
     struct DiscardResponseSink;
 
@@ -1876,8 +1876,11 @@ mod tests {
         multi_workspace_1
             .update(cx, |multi_workspace, _, cx| {
                 multi_workspace.workspace().update(cx, |workspace, cx| {
-                    let items = workspace.items(cx).collect::<Vec<_>>();
-                    assert_eq!(items.len(), 2, "Workspace should have two items");
+                    assert_eq!(
+                        file_item_count(workspace, cx),
+                        2,
+                        "Workspace should have two items"
+                    );
                 });
             })
             .unwrap();
@@ -1900,11 +1903,26 @@ mod tests {
         multi_workspace_2
             .update(cx, |multi_workspace, _, cx| {
                 multi_workspace.workspace().update(cx, |workspace, cx| {
-                    let items = workspace.items(cx).collect::<Vec<_>>();
-                    assert_eq!(items.len(), 1, "Workspace should have two items");
+                    assert_eq!(
+                        file_item_count(workspace, cx),
+                        1,
+                        "Workspace should have one item"
+                    );
                 });
             })
             .unwrap();
+    }
+
+    // Panels are hosted as pane items, so count only non-panel items when
+    // asserting how many files a workspace has open.
+    fn file_item_count(workspace: &Workspace, cx: &App) -> usize {
+        workspace
+            .items(cx)
+            .filter(|item| {
+                item.downcast::<workspace::panel_pane::PanelItem>()
+                    .is_none()
+            })
+            .count()
     }
 
     async fn open_workspace_file(
@@ -2270,17 +2288,23 @@ mod tests {
         // Verify the file was added to window2 (the focused one)
         multi_workspace_2
             .update(cx, |workspace, _, cx| {
-                let items = workspace.workspace().read(cx).items(cx).collect::<Vec<_>>();
                 // Should have 2 items now (file2.txt and new_file.txt)
-                assert_eq!(items.len(), 2, "Focused window should have 2 items");
+                assert_eq!(
+                    file_item_count(workspace.workspace().read(cx), cx),
+                    2,
+                    "Focused window should have 2 items"
+                );
             })
             .unwrap();
 
         // Verify window1 still has only 1 item
         multi_workspace_1
             .update(cx, |workspace, _, cx| {
-                let items = workspace.workspace().read(cx).items(cx).collect::<Vec<_>>();
-                assert_eq!(items.len(), 1, "Other window should still have 1 item");
+                assert_eq!(
+                    file_item_count(workspace.workspace().read(cx), cx),
+                    1,
+                    "Other window should still have 1 item"
+                );
             })
             .unwrap();
     }

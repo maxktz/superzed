@@ -4301,6 +4301,16 @@ mod tests {
             .unwrap();
     }
 
+    // Panel panes share `Workspace::panes`, so count only tabbed panes when
+    // asserting split layout.
+    fn tabbed_pane_count(workspace: &Workspace, cx: &App) -> usize {
+        workspace
+            .panes()
+            .iter()
+            .filter(|pane| pane.read(cx).is_tabbed())
+            .count()
+    }
+
     #[gpui::test]
     async fn test_pane_actions(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
@@ -4367,8 +4377,8 @@ mod tests {
         });
 
         cx.background_executor.run_until_parked();
-        workspace.read_with(cx, |workspace, _| {
-            assert_eq!(workspace.panes().len(), 1);
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(tabbed_pane_count(workspace, cx), 1);
             assert_eq!(workspace.active_pane(), &pane_1);
         });
 
@@ -4381,7 +4391,7 @@ mod tests {
         cx.background_executor.run_until_parked();
 
         workspace.read_with(cx, |workspace, cx| {
-            assert_eq!(workspace.panes().len(), 1);
+            assert_eq!(tabbed_pane_count(workspace, cx), 1);
             assert!(workspace.active_item(cx).is_none());
         });
 
@@ -4410,7 +4420,10 @@ mod tests {
             .unwrap();
         let cx = &mut VisualTestContext::from_window(*window, cx);
 
-        let mouse_position = point(px(250.), px(250.));
+        // Use the window center so the cursor lands on the editor rather than
+        // the sidebar chrome that surrounds workspace panes.
+        let viewport_size = cx.update(|window, _| window.viewport_size());
+        let mouse_position = point(viewport_size.width / 2., viewport_size.height / 2.);
 
         let event_modifiers = {
             #[cfg(target_os = "macos")]

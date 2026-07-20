@@ -650,13 +650,13 @@ mod tests {
         });
         let (workspace, cx) = init_test(user_settings_json, cx).await;
 
-        // User has buffer_font_size: 10, factory default is 15.
+        // User has buffer_font_size: 10, factory default is 13.5.
         cx.update(|_, cx| {
             assert_eq!(ThemeSettings::get_global(cx).buffer_font_size(cx), px(10.0));
         });
 
         // "Clean Slate" has base: "default" with no settings overrides,
-        // so we get the factory default (15), not the user's value (10).
+        // so we get the factory default (13.5), not the user's value (10).
         cx.dispatch_action(settings_profile_selector::Toggle);
         let picker = active_settings_profile_picker(&workspace, cx);
         cx.dispatch_action(SelectNext);
@@ -666,7 +666,7 @@ mod tests {
                 picker.delegate.selected_profile_name.as_deref(),
                 Some("Clean Slate")
             );
-            assert_eq!(ThemeSettings::get_global(cx).buffer_font_size(cx), px(15.0));
+            assert_eq!(ThemeSettings::get_global(cx).buffer_font_size(cx), px(13.5));
         });
 
         // "Custom on Defaults" has base: "default" with buffer_font_size: 30,

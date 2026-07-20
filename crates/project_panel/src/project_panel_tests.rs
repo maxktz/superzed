@@ -16,7 +16,7 @@ use smallvec::smallvec;
 use std::path::{Path, PathBuf};
 use util::{path, paths::PathStyle, rel_path::rel_path};
 use workspace::{
-    AppState, ItemHandle, MultiWorkspace, Pane, Workspace,
+    AppState, ItemHandle, MultiWorkspace, Pane, PaneKind, Workspace,
     item::{Item, ProjectItem, test::TestItem},
     register_project_item,
 };
@@ -6205,8 +6205,15 @@ async fn test_reveal_in_project_panel_fallback(cx: &mut gpui::TestAppContext) {
         panel
             .workspace
             .update(cx, |workspace, cx| {
+                // The panel itself is an item in the project pane, so check
+                // the tabbed panes instead of the workspace's active item.
+                let tabbed_pane_has_item = workspace
+                    .panes()
+                    .iter()
+                    .filter(|pane| pane.read(cx).pane_kind() == PaneKind::Tabs)
+                    .any(|pane| pane.read(cx).active_item().is_some());
                 assert!(
-                    workspace.active_item(cx).is_none(),
+                    !tabbed_pane_has_item,
                     "Workspace should not have an active item."
                 );
             })
@@ -6262,8 +6269,13 @@ async fn test_reveal_in_project_panel_fallback(cx: &mut gpui::TestAppContext) {
         panel
             .workspace
             .update(cx, |workspace, cx| {
+                let tabbed_pane_has_item = workspace
+                    .panes()
+                    .iter()
+                    .filter(|pane| pane.read(cx).pane_kind() == PaneKind::Tabs)
+                    .any(|pane| pane.read(cx).active_item().is_some());
                 assert!(
-                    workspace.active_item(cx).is_some(),
+                    tabbed_pane_has_item,
                     "Workspace should have an active item."
                 );
             })
@@ -6277,18 +6289,16 @@ async fn test_reveal_in_project_panel_fallback(cx: &mut gpui::TestAppContext) {
 
     // Focus again on the center pane so we're sure that the focus doesn't
     // remain on the project panel, otherwise later assertions wouldn't matter.
-    panel.update_in(cx, |panel, window, cx| {
-        panel
-            .workspace
-            .update(cx, |workspace, cx| {
-                workspace.focus_center_pane(window, cx);
-            })
-            .log_err();
-
-        assert!(
-            !panel.focus_handle(cx).is_focused(window),
-            "Project panel should not be focused after focusing on center pane."
-        );
+    // The project pane is the active pane while the panel is focused, so focus
+    // the tabbed pane's item directly instead of using focus_center_pane.
+    workspace.update_in(cx, |workspace, window, cx| {
+        let item = workspace
+            .panes()
+            .iter()
+            .find(|pane| pane.read(cx).pane_kind() == PaneKind::Tabs)
+            .and_then(|pane| pane.read(cx).active_item())
+            .expect("Tabbed pane should have an active item");
+        item.item_focus_handle(cx).focus(window, cx);
     });
 
     panel.update_in(cx, |panel, window, cx| {
@@ -6313,8 +6323,13 @@ async fn test_reveal_in_project_panel_fallback(cx: &mut gpui::TestAppContext) {
         panel
             .workspace
             .update(cx, |workspace, cx| {
+                let tabbed_pane_has_item = workspace
+                    .panes()
+                    .iter()
+                    .filter(|pane| pane.read(cx).pane_kind() == PaneKind::Tabs)
+                    .any(|pane| pane.read(cx).active_item().is_some());
                 assert!(
-                    workspace.active_item(cx).is_some(),
+                    tabbed_pane_has_item,
                     "Workspace should have an active item."
                 );
             })
@@ -11087,10 +11102,9 @@ pub(crate) fn init_test(cx: &mut TestAppContext) {
 
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings
-                    .project_panel
-                    .get_or_insert_default()
-                    .auto_fold_dirs = Some(false);
+                let project_panel = settings.project_panel.get_or_insert_default();
+                project_panel.auto_fold_dirs = Some(false);
+                project_panel.hide_root = Some(false);
                 settings.project.worktree.file_scan_exclusions = Some(Vec::new());
             });
         });
@@ -11107,10 +11121,9 @@ fn init_test_with_editor(cx: &mut TestAppContext) {
 
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings
-                    .project_panel
-                    .get_or_insert_default()
-                    .auto_fold_dirs = Some(false);
+                let project_panel = settings.project_panel.get_or_insert_default();
+                project_panel.auto_fold_dirs = Some(false);
+                project_panel.hide_root = Some(false);
                 settings.project.worktree.file_scan_exclusions = Some(Vec::new())
             });
         });
@@ -11128,10 +11141,9 @@ fn init_test_with_git_ui(cx: &mut TestAppContext) {
 
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings
-                    .project_panel
-                    .get_or_insert_default()
-                    .auto_fold_dirs = Some(false);
+                let project_panel = settings.project_panel.get_or_insert_default();
+                project_panel.auto_fold_dirs = Some(false);
+                project_panel.hide_root = Some(false);
                 settings.project.worktree.file_scan_exclusions = Some(Vec::new())
             });
         });

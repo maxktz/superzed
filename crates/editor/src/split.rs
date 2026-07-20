@@ -2404,6 +2404,15 @@ mod tests {
             cx.update_global::<SettingsStore, _>(|store, cx| {
                 store.update_user_settings(cx, |settings| {
                     settings.editor.diff_view_style = Some(style);
+                    // Pin the geometry-affecting settings these tests' expected
+                    // soft-wrap points were computed against, so they are
+                    // independent of this fork's default settings.
+                    settings
+                        .editor
+                        .gutter
+                        .get_or_insert_default()
+                        .min_line_number_digits = Some(4);
+                    settings.editor.scrollbar.get_or_insert_default().size = Some(15.0);
                 });
             });
             theme_settings::init(theme::LoadThemes::JustBase, cx);

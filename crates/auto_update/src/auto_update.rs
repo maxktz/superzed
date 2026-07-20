@@ -1413,8 +1413,12 @@ mod tests {
         });
 
         release_available.store(true, atomic::Ordering::SeqCst);
-        cx.background_executor.advance_clock(POLL_INTERVAL);
-        cx.background_executor.run_until_parked();
+        // Background polling is intentionally disabled in Superzed
+        // (`ReleaseChannel::poll_for_updates` is always false), so trigger the
+        // update check directly instead of advancing past POLL_INTERVAL.
+        auto_updater.update(cx, |updater, cx| {
+            updater.poll(UpdateCheckType::Automatic, cx)
+        });
 
         loop {
             cx.background_executor.timer(Duration::from_millis(0)).await;

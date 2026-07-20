@@ -2087,6 +2087,7 @@ pub mod tests {
                 ..InlayHintSettingsContent::default()
             })
         });
+        crate::editor_tests::pin_upstream_buffer_font_metrics(cx);
 
         let fs = FakeFs::new(cx.background_executor.clone());
         fs.insert_tree(

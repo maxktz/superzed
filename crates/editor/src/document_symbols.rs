@@ -342,7 +342,7 @@ mod tests {
 
     use crate::{
         Editor, LSP_REQUEST_DEBOUNCE_TIMEOUT,
-        editor_tests::{init_test, update_test_language_settings},
+        editor_tests::{init_test, update_test_editor_settings, update_test_language_settings},
         test::editor_lsp_test_context::EditorLspTestContext,
     };
 
@@ -901,6 +901,12 @@ mod tests {
         use ui::ActiveTheme as _;
 
         init_test(cx, |_| {});
+        update_test_editor_settings(cx, &|settings| {
+            settings
+                .toolbar
+                .get_or_insert_default()
+                .show_breadcrumb_symbols = Some(true);
+        });
 
         let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
 

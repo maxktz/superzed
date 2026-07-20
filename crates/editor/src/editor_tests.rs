@@ -10389,6 +10389,9 @@ async fn test_paste_multiline(cx: &mut TestAppContext) {
     // Paste it on a line with a lower indent level
     cx.update_editor(|e, window, cx| e.move_to_end(&Default::default(), window, cx));
     cx.update_editor(|e, window, cx| e.paste(&Paste, window, cx));
+    // Block auto-indent is applied asynchronously when it exceeds its
+    // synchronous time budget, so wait for it before asserting.
+    cx.wait_for_autoindent_applied().await;
     cx.assert_editor_state(indoc! {"
         const a: B = (
             c(),
@@ -27622,7 +27625,13 @@ async fn setup_indent_guides_editor(
     text: &str,
     cx: &mut TestAppContext,
 ) -> (BufferId, EditorTestContext) {
-    init_test(cx, |_| {});
+    init_test(cx, |settings| {
+        settings
+            .defaults
+            .indent_guides
+            .get_or_insert_default()
+            .enabled = Some(true);
+    });
 
     let mut cx = EditorTestContext::new(cx).await;
 
@@ -28267,7 +28276,13 @@ async fn test_active_indent_guide_non_matching_indent(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn test_indent_guide_with_expanded_diff_hunks(cx: &mut TestAppContext) {
-    init_test(cx, |_| {});
+    init_test(cx, |settings| {
+        settings
+            .defaults
+            .indent_guides
+            .get_or_insert_default()
+            .enabled = Some(true);
+    });
     let mut cx = EditorTestContext::new(cx).await;
     let text = indoc! {
         "
@@ -34985,6 +35000,20 @@ pub(crate) fn update_test_editor_settings(
     cx.update(|cx| {
         SettingsStore::update_global(cx, |store, cx| {
             store.update_user_settings(cx, |settings| f(&mut settings.editor));
+        })
+    })
+}
+
+/// Pins the buffer line height to the value the upstream test expectations
+/// were computed against (the buffer font itself is already pinned by
+/// `settings::test_settings`), for tests whose assertions depend on how many
+/// rows fit into a window of a fixed pixel size.
+pub(crate) fn pin_upstream_buffer_font_metrics(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.theme.buffer_line_height = Some(settings::BufferLineHeight::Comfortable);
+            });
         })
     })
 }

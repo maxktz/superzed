@@ -6394,7 +6394,17 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.center.remove(&pane, cx).unwrap() {
+        // Keep the last tabbed pane alive even when it has no items: panel
+        // panes share the center, so `PaneGroup::remove` would happily remove
+        // it, losing its navigation history and leaving no pane to open items
+        // in. Upstream reaches the same outcome because the last pane is the
+        // center's root, which `remove` refuses to drop.
+        let is_last_tabbed_pane = pane.read(cx).is_tabbed()
+            && !self
+                .panes
+                .iter()
+                .any(|other| *other != pane && other.read(cx).is_tabbed());
+        if !is_last_tabbed_pane && self.center.remove(&pane, cx).unwrap() {
             if self
                 .maximized_pane
                 .as_ref()
@@ -7420,9 +7430,13 @@ impl Workspace {
     }
 
     pub fn on_window_activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if window.is_window_active() {
-            self.update_active_view_for_followers(window, cx);
+        // Runs on deactivation too: it then publishes an empty active view,
+        // resetting `last_active_view_id` so that reactivating this window
+        // re-sends the active view to followers. This used to be handled by
+        // the per-workspace `TitleBar`, which no longer exists.
+        self.update_active_view_for_followers(window, cx);
 
+        if window.is_window_active() {
             if let Some(database_id) = self.database_id {
                 let db = WorkspaceDb::global(cx);
                 cx.background_spawn(async move { db.update_timestamp(database_id).await })
@@ -7597,10 +7611,20 @@ impl Workspace {
             }
             focus_on.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
         } else if removing_active_pane {
-            let fallback_pane = self.panes.last().unwrap().clone();
-            self.set_active_pane(&fallback_pane, window, cx);
-            if !self.has_active_modal(window, cx) {
-                fallback_pane.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+            // Prefer a tabbed pane over panel panes so closing a split hands
+            // focus back to an editor pane rather than a hosted panel.
+            let fallback_pane = self
+                .panes
+                .iter()
+                .rev()
+                .find(|pane| pane.read(cx).is_tabbed())
+                .or_else(|| self.panes.last())
+                .cloned();
+            if let Some(fallback_pane) = fallback_pane {
+                self.set_active_pane(&fallback_pane, window, cx);
+                if !self.has_active_modal(window, cx) {
+                    fallback_pane.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+                }
             }
         }
         if self.last_active_center_pane == Some(pane.downgrade()) {
