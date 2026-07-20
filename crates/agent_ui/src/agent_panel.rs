@@ -9572,9 +9572,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_terminal_custom_title_rename_persists_to_metadata_store(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_terminal_custom_title_rename_persists_to_metadata_store(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_panel(cx).await;
         cx.update(|_, cx| {
             TerminalThreadMetadataStore::init_global(cx);

@@ -689,7 +689,10 @@ mod tests {
         init_test(cx);
 
         let folder_paths = PathList::new(&[Path::new("/repo")]);
-        let mut saved = metadata("Dev Server", WorktreePaths::from_folder_paths(&folder_paths));
+        let mut saved = metadata(
+            "Dev Server",
+            WorktreePaths::from_folder_paths(&folder_paths),
+        );
         saved.custom_title = Some("Fix bug".into());
         saved.working_directory = Some(PathBuf::from("/repo/src"));
         let terminal_id = saved.terminal_id;
@@ -724,7 +727,10 @@ mod tests {
         init_test(cx);
 
         let folder_paths = PathList::new(&[Path::new("/repo")]);
-        let mut saved = metadata("Dev Server", WorktreePaths::from_folder_paths(&folder_paths));
+        let mut saved = metadata(
+            "Dev Server",
+            WorktreePaths::from_folder_paths(&folder_paths),
+        );
         saved.working_directory = Some(PathBuf::from("/repo"));
         let terminal_id = saved.terminal_id;
 
@@ -776,11 +782,7 @@ mod tests {
         middle.created_at = base;
         let mut newest = metadata("third", WorktreePaths::from_folder_paths(&folder_paths));
         newest.created_at = base + chrono::Duration::seconds(60);
-        let expected_ids = vec![
-            oldest.terminal_id,
-            middle.terminal_id,
-            newest.terminal_id,
-        ];
+        let expected_ids = vec![oldest.terminal_id, middle.terminal_id, newest.terminal_id];
 
         // Save out of creation order to prove the sort is not insertion order.
         cx.update(|cx| {

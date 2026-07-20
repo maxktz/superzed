@@ -1463,10 +1463,16 @@ impl ContentBlock {
         };
         let new_content = &text_content.text;
         markdown.update(cx, |markdown, cx| {
-            let current = markdown.source().to_string();
-            match new_content.strip_prefix(&current) {
-                Some("") => {}
-                Some(suffix) => markdown.append(suffix, cx),
+            // Compare against the source in place; copying it out would cost a
+            // full O(len) allocation on every streamed snapshot.
+            let prefix_len = if new_content.starts_with(markdown.source().as_str()) {
+                Some(markdown.source().len())
+            } else {
+                None
+            };
+            match prefix_len {
+                Some(len) if len == new_content.len() => {}
+                Some(len) => markdown.append(&new_content[len..], cx),
                 None => markdown.reset(new_content.clone().into(), cx),
             }
         });
@@ -2122,6 +2128,9 @@ struct StreamingTextBuffer {
     bytes_to_reveal_per_tick: usize,
     /// The Markdown entity being streamed into.
     target: Entity<Markdown>,
+    /// Index of the thread entry containing `target`, used to emit
+    /// `EntryUpdated` when buffered text is actually revealed.
+    entry_index: usize,
     /// Timer task that periodically moves text from `pending` into `source`.
     _reveal_task: Task<()>,
 }
@@ -2786,9 +2795,13 @@ impl AcpThread {
             if let Some(markdown) =
                 self.streaming_markdown_target(message_id.as_ref(), is_thought, indented)
             {
-                let entries_len = self.entries.len();
-                cx.emit(AcpThreadEvent::EntryUpdated(entries_len - 1));
-                self.buffer_streaming_text(&markdown, text_content.text.clone(), cx);
+                // Don't emit EntryUpdated here: the chunk only lands in the
+                // pending buffer, so subscribers would resync an entry whose
+                // content hasn't changed yet. The reveal tick and flush emit
+                // it when text is actually appended, coalescing per-chunk
+                // event fanout down to at most one event per reveal tick.
+                let entry_index = self.entries.len() - 1;
+                self.buffer_streaming_text(&markdown, entry_index, text_content.text.clone(), cx);
                 return;
             }
         }
@@ -2913,12 +2926,14 @@ impl AcpThread {
     fn buffer_streaming_text(
         &mut self,
         markdown: &Entity<Markdown>,
+        entry_index: usize,
         text: String,
         cx: &mut Context<Self>,
     ) {
         if let Some(buffer) = &mut self.streaming_text_buffer {
             if buffer.target.entity_id() == markdown.entity_id() {
                 buffer.pending.push_str(&text);
+                buffer.entry_index = entry_index;
 
                 buffer.bytes_to_reveal_per_tick = (buffer.pending.len() as f32
                     / StreamingTextBuffer::REVEAL_TARGET
@@ -2939,6 +2954,7 @@ impl AcpThread {
             pending: text,
             bytes_to_reveal_per_tick: bytes_to_reveal,
             target,
+            entry_index,
             _reveal_task,
         });
     }
@@ -2953,6 +2969,7 @@ impl AcpThread {
                 buffer
                     .target
                     .update(cx, |markdown, cx| markdown.append(&buffer.pending, cx));
+                cx.emit(AcpThreadEvent::EntryUpdated(buffer.entry_index));
             }
         }
     }
@@ -2988,6 +3005,7 @@ impl AcpThread {
                             markdown.append(&buffer.pending[..byte_boundary], cx);
                             buffer.pending.drain(..byte_boundary);
                         });
+                        cx.emit(AcpThreadEvent::EntryUpdated(buffer.entry_index));
 
                         true
                     })
@@ -5775,6 +5793,146 @@ mod tests {
                 id.as_ref().map(ToString::to_string).as_deref(),
                 Some("msg_agent_2")
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_streaming_text_coalesces_entry_updated_events(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let entry_updated_count = Rc::new(RefCell::new(0_usize));
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&thread, {
+                let entry_updated_count = entry_updated_count.clone();
+                move |_, event, _| {
+                    if let AcpThreadEvent::EntryUpdated(_) = event {
+                        *entry_updated_count.borrow_mut() += 1;
+                    }
+                }
+            })
+        });
+
+        const CHUNK_COUNT: usize = 1000;
+        let started = std::time::Instant::now();
+        for i in 0..CHUNK_COUNT {
+            thread
+                .update(cx, |thread, cx| {
+                    thread.handle_session_update(
+                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                            format!("chunk {i} ").into(),
+                        )),
+                        cx,
+                    )
+                })
+                .unwrap();
+            cx.executor().advance_clock(Duration::from_millis(1));
+        }
+        // Let the smooth-streaming reveal buffer drain completely.
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        let elapsed = started.elapsed();
+
+        let expected: String = (0..CHUNK_COUNT).map(|i| format!("chunk {i} ")).collect();
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(thread.entries().len(), 1);
+            let AgentThreadEntry::AssistantMessage(message) = &thread.entries()[0] else {
+                panic!("expected assistant entry");
+            };
+            assert_eq!(message.chunks.len(), 1);
+            let AssistantMessageChunk::Message { block, .. } = &message.chunks[0] else {
+                panic!("expected message chunk");
+            };
+            assert_eq!(block.to_markdown(cx), expected);
+        });
+
+        let count = *entry_updated_count.borrow();
+        eprintln!(
+            "streamed {CHUNK_COUNT} chunks in {elapsed:?}; EntryUpdated emitted {count} times"
+        );
+        // Reveal ticks fire every 16ms of virtual time (~125 over the 2s
+        // simulated above), so a coalesced implementation stays far below one
+        // event per streamed chunk. Before coalescing this was ~1 per chunk.
+        assert!(
+            count < CHUNK_COUNT / 4,
+            "EntryUpdated fanout not coalesced: {count} events for {CHUNK_COUNT} chunks"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_flush_streaming_text_emits_entry_updated(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .unwrap();
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&thread, {
+                let events = events.clone();
+                move |_, event: &AcpThreadEvent, _| match event {
+                    AcpThreadEvent::EntryUpdated(ix) => {
+                        events.borrow_mut().push(format!("updated({ix})"))
+                    }
+                    AcpThreadEvent::NewEntry => events.borrow_mut().push("new".to_string()),
+                    _ => {}
+                }
+            })
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("Hello ".into())),
+                    cx,
+                )
+                .unwrap();
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new("world".into())),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        // The second chunk is buffered for smooth streaming: no EntryUpdated
+        // is emitted until the buffered text is actually revealed or flushed.
+        assert_eq!(events.borrow().as_slice(), ["new"]);
+
+        // Pushing a tool call flushes the streaming buffer synchronously; the
+        // flush must emit EntryUpdated for the message entry so views remeasure
+        // the appended text.
+        thread.update(cx, |thread, cx| {
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::ToolCall(acp::ToolCall::new("tool_1", "List files")),
+                    cx,
+                )
+                .unwrap();
+        });
+
+        assert_eq!(events.borrow().as_slice(), ["new", "updated(0)", "new"]);
+        thread.read_with(cx, |thread, cx| {
+            let AgentThreadEntry::AssistantMessage(message) = &thread.entries()[0] else {
+                panic!("expected assistant entry");
+            };
+            assert_eq!(message.to_markdown(cx), "## Assistant\n\nHello world\n\n");
         });
     }
 

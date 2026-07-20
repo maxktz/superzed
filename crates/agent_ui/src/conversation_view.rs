@@ -737,10 +737,7 @@ impl ConversationView {
         if self.root_thread_has_pending_elicitation(cx) {
             return ThreadRunState::ParkedOnHuman(ParkedReason::Elicitation);
         }
-        match self
-            .root_thread(cx)
-            .map(|thread| thread.read(cx).status())
-        {
+        match self.root_thread(cx).map(|thread| thread.read(cx).status()) {
             Some(ThreadStatus::Generating) => ThreadRunState::Running,
             Some(ThreadStatus::Idle) | None => ThreadRunState::Idle,
         }
