@@ -51,7 +51,7 @@ pub struct AuthenticatedUser {
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Serialize, Deserialize)]
 pub struct OrganizationId(pub Arc<str>);
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct Organization {
     pub id: OrganizationId,
     pub name: Arc<str>,
@@ -93,6 +93,16 @@ pub struct UpdateSystemSettingsBody {
 #[derive(Debug, Default, PartialEq, Clone, Serialize, Deserialize)]
 pub struct SystemSettings {
     pub selected_organization_id: Option<OrganizationId>,
+}
+
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+pub struct RenameOrganizationBody {
+    pub name: String,
+}
+
+#[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
+pub struct RenameOrganizationResponse {
+    pub organization: Organization,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]

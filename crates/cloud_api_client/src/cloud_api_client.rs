@@ -187,6 +187,30 @@ impl CloudApiClient {
             .await
     }
 
+    pub async fn rename_organization(
+        &self,
+        organization_id: &OrganizationId,
+        name: &str,
+    ) -> Result<Organization, ClientApiError> {
+        let request_builder = Request::builder().method(Method::PATCH).uri(
+            self.http_client
+                .build_zed_cloud_url(&format!("/client/organizations/{}", organization_id.0))
+                .map_err(ClientApiError::RequestBuildFailed)?
+                .as_ref(),
+        );
+
+        let response: RenameOrganizationResponse = self
+            .send_authenticated_json_request(
+                request_builder,
+                Json(RenameOrganizationBody {
+                    name: name.to_string(),
+                }),
+            )
+            .await?;
+
+        Ok(response.organization)
+    }
+
     pub async fn send_authenticated_json_request<T: DeserializeOwned>(
         &self,
         request_builder: request::Builder,

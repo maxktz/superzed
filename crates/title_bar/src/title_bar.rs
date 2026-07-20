@@ -2,11 +2,13 @@ mod application_menu;
 pub mod collab;
 mod onboarding_banner;
 mod plan_chip;
+mod rename_organization_modal;
 mod sidebar_chrome_settings;
 mod update_version;
 
 use crate::application_menu::{ApplicationMenu, show_menus};
 use crate::plan_chip::PlanChip;
+use crate::rename_organization_modal::RenameOrganizationModal;
 use agent_settings::{AgentSettings, WindowLayout};
 use git_ui::worktree_picker::WorktreePicker;
 pub use platform_title_bar::{
@@ -1366,6 +1368,32 @@ impl SidebarChrome {
                                     }
                                 },
                             );
+                        }
+
+                        if let Some(personal_organization) = current_organization
+                            .clone()
+                            .filter(|organization| organization.is_personal)
+                        {
+                            let user_store = user_store.clone();
+                            let workspace = workspace.clone();
+                            this = this.entry("Rename Organization…", None, move |window, cx| {
+                                let organization = personal_organization.clone();
+                                let user_store = user_store.clone();
+                                let modal_workspace = workspace.clone();
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        workspace.toggle_modal(window, cx, move |window, cx| {
+                                            RenameOrganizationModal::new(
+                                                organization,
+                                                user_store,
+                                                modal_workspace,
+                                                window,
+                                                cx,
+                                            )
+                                        });
+                                    })
+                                    .log_err();
+                            });
                         }
 
                         this.separator()

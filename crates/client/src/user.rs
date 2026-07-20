@@ -1,5 +1,5 @@
 use super::{Client, Status, TypedEnvelope, proto};
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Utc};
 use cloud_api_client::websocket_protocol::MessageToClient;
 use cloud_api_client::{
@@ -29,6 +29,8 @@ use text::ReplicaId;
 use util::{ResultExt, TryFutureExt as _};
 
 pub type LegacyUserId = u64;
+
+pub const MAX_ORGANIZATION_NAME_LENGTH: usize = 100;
 
 #[derive(
     Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy, serde::Serialize, serde::Deserialize,
@@ -144,6 +146,7 @@ pub enum Event {
     PrivateUserInfoUpdated,
     PlanUpdated,
     OrganizationChanged,
+    OrganizationRenamed,
 }
 
 #[derive(Clone, Copy)]
@@ -736,6 +739,91 @@ impl UserStore {
         &self.organizations
     }
 
+    pub fn rename_organization(
+        &mut self,
+        organization_id: OrganizationId,
+        new_name: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let new_name = new_name.trim().to_string();
+        if let Err(error) = self.validate_organization_rename(&organization_id, &new_name) {
+            return Task::ready(Err(error));
+        }
+
+        let Some(client) = self.client.upgrade() else {
+            return Task::ready(Err(anyhow!("client was dropped")));
+        };
+        let cloud_client = client.cloud_client();
+
+        cx.spawn(async move |this, cx| {
+            let renamed_organization = cloud_client
+                .rename_organization(&organization_id, &new_name)
+                .await
+                .context("failed to rename organization")?;
+            this.update(cx, |this, cx| {
+                this.apply_organization_rename(Arc::new(renamed_organization), cx)
+            })?
+        })
+    }
+
+    fn validate_organization_rename(
+        &self,
+        organization_id: &OrganizationId,
+        new_name: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(!new_name.is_empty(), "Organization name cannot be empty.");
+        anyhow::ensure!(
+            new_name.chars().count() <= MAX_ORGANIZATION_NAME_LENGTH,
+            "Organization name cannot be longer than {MAX_ORGANIZATION_NAME_LENGTH} characters."
+        );
+
+        let organization = self
+            .organizations
+            .iter()
+            .find(|organization| organization.id == *organization_id)
+            .with_context(|| format!("Organization {} not found.", organization_id.0))?;
+        anyhow::ensure!(
+            organization.name.as_ref() != new_name,
+            "The new name is the same as the current name."
+        );
+
+        let collides_with_other_organization = self
+            .organizations
+            .iter()
+            .any(|other| other.id != *organization_id && other.name.eq_ignore_ascii_case(new_name));
+        anyhow::ensure!(
+            !collides_with_other_organization,
+            "An organization named \"{new_name}\" already exists."
+        );
+
+        Ok(())
+    }
+
+    fn apply_organization_rename(
+        &mut self,
+        renamed_organization: Arc<Organization>,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let organization = self
+            .organizations
+            .iter_mut()
+            .find(|organization| organization.id == renamed_organization.id)
+            .context("renamed organization is no longer present")?;
+        *organization = renamed_organization.clone();
+
+        if self
+            .current_organization
+            .as_ref()
+            .is_some_and(|current| current.id == renamed_organization.id)
+        {
+            self.current_organization = Some(renamed_organization);
+        }
+
+        cx.emit(Event::OrganizationRenamed);
+        cx.notify();
+        Ok(())
+    }
+
     pub fn plan_for_organization(&self, organization_id: &OrganizationId) -> Option<Plan> {
         self.plans_by_organization.get(organization_id).copied()
     }
@@ -1081,5 +1169,185 @@ impl EditPredictionUsage {
             EDIT_PREDICTIONS_USAGE_AMOUNT_HEADER_NAME,
             headers,
         )?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clock::FakeSystemClock;
+    use cloud_api_client::{RenameOrganizationBody, RenameOrganizationResponse};
+    use futures::AsyncReadExt as _;
+    use gpui::TestAppContext;
+    use http_client::FakeHttpClient;
+    use settings::SettingsStore;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+    }
+
+    fn organization(id: &str, name: &str, is_personal: bool) -> Arc<Organization> {
+        Arc::new(Organization {
+            id: OrganizationId(id.into()),
+            name: name.into(),
+            is_personal,
+        })
+    }
+
+    fn setup_user_store(
+        user_store: &Entity<UserStore>,
+        cx: &mut TestAppContext,
+    ) -> Arc<AtomicUsize> {
+        cx.run_until_parked();
+
+        user_store.update(cx, |user_store, _| {
+            user_store.organizations = vec![
+                organization("org-1", "Personal", true),
+                organization("org-2", "Acme", false),
+            ];
+            user_store.current_organization = user_store.organizations.first().cloned();
+        });
+
+        let renamed_events = Arc::new(AtomicUsize::new(0));
+        cx.update({
+            let renamed_events = renamed_events.clone();
+            let user_store = user_store.clone();
+            move |cx| {
+                cx.subscribe(&user_store, move |_, event, _| {
+                    if let Event::OrganizationRenamed = event {
+                        renamed_events.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+                .detach();
+            }
+        });
+
+        renamed_events
+    }
+
+    #[gpui::test]
+    async fn test_rename_organization(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let http_client = FakeHttpClient::create(|request| async move {
+            assert_eq!(request.method().as_str(), "PATCH");
+            assert_eq!(request.uri().path(), "/client/organizations/org-1");
+
+            let mut body = String::new();
+            request.into_body().read_to_string(&mut body).await?;
+            let rename_body: RenameOrganizationBody = serde_json::from_str(&body)?;
+
+            let response = RenameOrganizationResponse {
+                organization: Organization {
+                    id: OrganizationId("org-1".into()),
+                    name: rename_body.name.into(),
+                    is_personal: true,
+                },
+            };
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(serde_json::to_string(&response)?.into())?)
+        });
+        let client = cx.update(|cx| Client::new(Arc::new(FakeSystemClock::new()), http_client, cx));
+        client
+            .cloud_client()
+            .set_credentials(1, "access-token".into());
+        let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
+        let renamed_events = setup_user_store(&user_store, cx);
+
+        user_store
+            .update(cx, |user_store, cx| {
+                user_store.rename_organization(
+                    OrganizationId("org-1".into()),
+                    "  My Workspace  ",
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+
+        user_store.read_with(cx, |user_store, _| {
+            assert_eq!(user_store.organizations[0].name.as_ref(), "My Workspace");
+            assert_eq!(user_store.organizations[1].name.as_ref(), "Acme");
+            let current_organization = user_store.current_organization.as_ref().unwrap();
+            assert_eq!(current_organization.name.as_ref(), "My Workspace");
+            assert!(current_organization.is_personal);
+        });
+        assert_eq!(renamed_events.load(Ordering::SeqCst), 1);
+    }
+
+    #[gpui::test]
+    async fn test_rename_organization_rejects_invalid_names(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let request_made = Arc::new(AtomicBool::new(false));
+        let http_client = FakeHttpClient::create({
+            let request_made = request_made.clone();
+            move |_request| {
+                request_made.store(true, Ordering::SeqCst);
+                async move {
+                    Ok(http_client::Response::builder()
+                        .status(500)
+                        .body("".into())?)
+                }
+            }
+        });
+        let client = cx.update(|cx| Client::new(Arc::new(FakeSystemClock::new()), http_client, cx));
+        client
+            .cloud_client()
+            .set_credentials(1, "access-token".into());
+        let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
+        let renamed_events = setup_user_store(&user_store, cx);
+
+        let rename = |new_name: String, cx: &mut TestAppContext| {
+            user_store.update(cx, |user_store, cx| {
+                user_store.rename_organization(OrganizationId("org-1".into()), &new_name, cx)
+            })
+        };
+
+        let error = rename("   ".into(), cx).await.unwrap_err();
+        assert!(error.to_string().contains("empty"), "{error}");
+
+        let error = rename("x".repeat(MAX_ORGANIZATION_NAME_LENGTH + 1), cx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("longer than"), "{error}");
+
+        let error = rename("Personal".into(), cx).await.unwrap_err();
+        assert!(
+            error.to_string().contains("same as the current name"),
+            "{error}"
+        );
+
+        let error = rename("acme".into(), cx).await.unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error}");
+
+        let error = user_store
+            .update(cx, |user_store, cx| {
+                user_store.rename_organization(OrganizationId("org-404".into()), "New Name", cx)
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not found"), "{error}");
+
+        user_store.read_with(cx, |user_store, _| {
+            assert_eq!(user_store.organizations[0].name.as_ref(), "Personal");
+            assert_eq!(user_store.organizations[1].name.as_ref(), "Acme");
+            assert_eq!(
+                user_store
+                    .current_organization
+                    .as_ref()
+                    .unwrap()
+                    .name
+                    .as_ref(),
+                "Personal"
+            );
+        });
+        assert_eq!(renamed_events.load(Ordering::SeqCst), 0);
+        assert!(!request_made.load(Ordering::SeqCst));
     }
 }
