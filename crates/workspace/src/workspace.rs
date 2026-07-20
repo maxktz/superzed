@@ -8552,7 +8552,6 @@ impl Workspace {
             )
     }
 
-
     /// Returns the currently-visible major window regions ("parts"), in a stable
     /// cyclic order: title bar, left dock, editor, right dock, bottom dock,
     /// status bar. Closed docks are skipped. Used by

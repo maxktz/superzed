@@ -2410,8 +2410,7 @@ impl Sidebar {
                 continue;
             }
 
-            let counts_task =
-                git_ui::project_diff::uncommitted_changed_lines(&project, &repo, cx);
+            let counts_task = git_ui::project_diff::uncommitted_changed_lines(&project, &repo, cx);
             let previous_counts = self
                 .repo_diff_totals
                 .get(&work_dir)
@@ -4094,7 +4093,11 @@ impl Sidebar {
             });
         }
 
-        fn reveal_agent_panel(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+        fn reveal_agent_panel(
+            workspace: &mut Workspace,
+            window: &mut Window,
+            cx: &mut Context<Workspace>,
+        ) {
             workspace.reveal_panel::<AgentPanel>(window, cx);
             // `reveal_panel` activates the hosted panel-pane item and returns
             // before touching the dock, but dock open state is what gets
@@ -4103,10 +4106,8 @@ impl Sidebar {
             // this cannot double-mount the panel.
             let docks: Vec<_> = workspace.all_docks().into_iter().cloned().collect();
             for dock in docks {
-                let hosts_agent_panel = dock
-                    .read(cx)
-                    .panel_index_for_type::<AgentPanel>()
-                    .is_some();
+                let hosts_agent_panel =
+                    dock.read(cx).panel_index_for_type::<AgentPanel>().is_some();
                 if hosts_agent_panel && !dock.read(cx).is_open() {
                     dock.update(cx, |dock, cx| dock.set_open(true, window, cx));
                 }

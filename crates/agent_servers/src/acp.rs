@@ -2717,7 +2717,6 @@ mod tests {
         });
     }
 
-
     #[gpui::test]
     async fn test_server_alive_reflects_simulated_server_exit(cx: &mut gpui::TestAppContext) {
         init_feature_flags_test(cx);

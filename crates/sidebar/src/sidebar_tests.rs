@@ -15057,9 +15057,7 @@ async fn test_project_header_diff_stats_match_uncommitted_changed_lines(cx: &mut
         .read_with(cx, |project, cx| project.active_repository(cx))
         .expect("project should have an active repository");
     let canonical_counts = cx
-        .update(|_window, cx| {
-            git_ui::project_diff::uncommitted_changed_lines(&project, &repo, cx)
-        })
+        .update(|_window, cx| git_ui::project_diff::uncommitted_changed_lines(&project, &repo, cx))
         .await
         .expect("canonical diffstat should compute");
 
