@@ -56,6 +56,7 @@ zed_actions.workspace = true
 [dev-dependencies]
 acp_thread = { workspace = true, features = ["test-support"] }
 agent = { workspace = true, features = ["test-support"] }
+call = { workspace = true, features = ["test-support"] }
 agent_ui = { workspace = true, features = ["test-support"] }
 editor.workspace = true
 extension.workspace = true
@@ -80,4 +81,8 @@ remote = { workspace = true, features = ["test-support"] }
 remote_connection = { workspace = true, features = ["test-support"] }
 remote_server = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
+# Keeps title_bar's cfg(test-support) match arms in sync with the
+# remote/test-support feature enabled above; without it the unified test
+# build sees remote's Mock variant but compiles title_bar without its arm.
+title_bar = { workspace = true, features = ["test-support"] }
 workspace = { workspace = true, features = ["test-support"] }
