@@ -21,7 +21,7 @@ use agent_ui::{
     DEFAULT_THREAD_TITLE, ManageProfiles, NewTerminalThread, NewThread, RenameSelectedThread,
     TerminalId, ThreadId, ThreadImportModal, ThreadTitleRegenerationResult, ToggleOptionsMenu,
     channels_with_threads, connection_store_for_project, create_agent_thread_in_workspace,
-    import_threads_from_other_channels, open_agent_thread_in_workspace,
+    import_threads_from_other_channels,
 };
 use agent_ui::{MessageEditorEvent, StateChange, thread_worktree_archive};
 use chrono::{DateTime, Utc};
@@ -622,25 +622,44 @@ fn root_repository_snapshots(
     workspace: &Entity<Workspace>,
     cx: &App,
 ) -> impl Iterator<Item = project::git_store::RepositorySnapshot> {
+    root_repositories(workspace, cx)
+        .into_iter()
+        .map(|(_, snapshot)| snapshot)
+}
+
+fn root_repositories(
+    workspace: &Entity<Workspace>,
+    cx: &App,
+) -> Vec<(
+    Entity<project::git_store::Repository>,
+    project::git_store::RepositorySnapshot,
+)> {
     let path_list = workspace_path_list(workspace, cx);
     let project = workspace.read(cx).project().read(cx);
-    project.repositories(cx).values().filter_map(move |repo| {
-        let snapshot = repo.read(cx).snapshot();
-        let work_directory = snapshot.work_directory_abs_path.as_ref();
-        let matches_root = path_list.paths().iter().any(|root| {
-            let root = root.as_path();
-            root == work_directory
-                || root.starts_with(work_directory)
-                || work_directory.starts_with(root)
-        });
-        matches_root.then_some(snapshot)
-    })
+    project
+        .repositories(cx)
+        .values()
+        .filter_map(move |repo| {
+            let snapshot = repo.read(cx).snapshot();
+            let work_directory = snapshot.work_directory_abs_path.as_ref();
+            let matches_root = path_list.paths().iter().any(|root| {
+                let root = root.as_path();
+                root == work_directory
+                    || root.starts_with(work_directory)
+                    || work_directory.starts_with(root)
+            });
+            matches_root.then(|| (repo.clone(), snapshot))
+        })
+        .collect()
 }
 
 /// Aggregated git state for a project group's row: the branch of the first
 /// resolved root repository plus uncommitted working-tree diff stats summed
-/// over all root repositories of the group's open workspaces. Computed once
-/// per `rebuild_contents` pass from already-cached repository snapshots.
+/// over all root repositories of the group's open workspaces. Branches come
+/// from already-cached repository snapshots; the +/- line counts come from
+/// `repo_diff_totals`, the sidebar's cache of the canonical
+/// [`git_ui::project_diff::uncommitted_changed_lines`] counts, so the numbers
+/// always agree with the Uncommitted Diff view.
 #[derive(Clone, Debug, Default)]
 struct ProjectGitInfo {
     branch: Option<SharedString>,
@@ -648,7 +667,21 @@ struct ProjectGitInfo {
     lines_removed: u32,
 }
 
-fn project_group_git_info(workspaces: &[Entity<Workspace>], cx: &App) -> ProjectGitInfo {
+/// Cached canonical uncommitted +/- counts for one repository, keyed by the
+/// repository's work directory. `scan_id` records which status scan the
+/// counts were computed for; a newer scan triggers a recompute while the old
+/// counts keep rendering to avoid flicker.
+struct RepoDiffTotals {
+    scan_id: u64,
+    counts: Option<(u32, u32)>,
+    _task: Option<Task<()>>,
+}
+
+fn project_group_git_info(
+    workspaces: &[Entity<Workspace>],
+    repo_diff_totals: &HashMap<Arc<Path>, RepoDiffTotals>,
+    cx: &App,
+) -> ProjectGitInfo {
     let mut info = ProjectGitInfo::default();
     let mut seen_repositories: HashSet<Arc<Path>> = HashSet::new();
     for workspace in workspaces {
@@ -661,10 +694,23 @@ fn project_group_git_info(workspaces: &[Entity<Workspace>], cx: &App) -> Project
             {
                 info.branch = Some(SharedString::from(Arc::<str>::from(branch.name())));
             }
-            for entry in snapshot.status() {
-                if let Some(stat) = entry.diff_stat {
-                    info.lines_added += stat.added;
-                    info.lines_removed += stat.deleted;
+            if let Some((added, removed)) = repo_diff_totals
+                .get(&snapshot.work_directory_abs_path)
+                .and_then(|totals| totals.counts)
+            {
+                info.lines_added += added;
+                info.lines_removed += removed;
+            } else {
+                // Canonical counts are computed for local repositories only
+                // (and lag one async hop behind). Until they are available —
+                // and for remote repositories, where opening every changed
+                // buffer would be too costly — fall back to the status
+                // entries' whole-file diff stats.
+                for entry in snapshot.status() {
+                    if let Some(stat) = entry.diff_stat {
+                        info.lines_added += stat.added;
+                        info.lines_removed += stat.deleted;
+                    }
                 }
             }
         }
@@ -933,6 +979,10 @@ pub struct Sidebar {
     project_header_new_thread_menu_handles: HashMap<usize, PopoverMenuHandle<ContextMenu>>,
     project_header_menu_ix: Option<usize>,
     worktree_default_branches: HashMap<ProjectGroupKey, DefaultBranchCache>,
+    /// Canonical uncommitted +/- line counts per repository work directory,
+    /// computed asynchronously via
+    /// [`git_ui::project_diff::uncommitted_changed_lines`].
+    repo_diff_totals: HashMap<Arc<Path>, RepoDiffTotals>,
     _subscriptions: Vec<gpui::Subscription>,
     _draft_editor_observations: Vec<gpui::Subscription>,
     update_task: Option<Task<()>>,
@@ -1098,6 +1148,7 @@ impl Sidebar {
             project_header_new_thread_menu_handles: HashMap::new(),
             project_header_menu_ix: None,
             worktree_default_branches: HashMap::new(),
+            repo_diff_totals: HashMap::new(),
             _subscriptions: Vec::new(),
             _draft_editor_observations: Vec::new(),
             update_task: None,
@@ -1795,7 +1846,7 @@ impl Sidebar {
                 .as_ref()
                 .is_some_and(|active| group_workspaces.contains(active));
 
-            let git_info = project_group_git_info(group_workspaces, cx);
+            let git_info = project_group_git_info(group_workspaces, &self.repo_diff_totals, cx);
 
             // Collect live thread infos from all workspaces in this group.
             let live_infos = group_workspaces
@@ -2280,6 +2331,8 @@ impl Sidebar {
             return;
         }
 
+        self.refresh_repo_diff_totals(&multi_workspace, cx);
+
         let had_notifications = self.has_notifications(cx);
         let previous_shapes: Vec<EntryShape> =
             self.entry_shapes(multi_workspace.read(cx)).collect();
@@ -2309,6 +2362,94 @@ impl Sidebar {
         }
 
         cx.notify();
+    }
+
+    /// Recomputes the canonical per-repository uncommitted +/- line counts
+    /// whenever a repository's status scan advances. Uses the same
+    /// [`git_ui::project_diff::uncommitted_changed_lines`] helper as the
+    /// Uncommitted Diff view so the sidebar's numbers always match it.
+    fn refresh_repo_diff_totals(
+        &mut self,
+        multi_workspace: &Entity<MultiWorkspace>,
+        cx: &mut Context<Self>,
+    ) {
+        let workspaces: Vec<_> = multi_workspace.read(cx).workspaces().cloned().collect();
+
+        let mut current_repos: HashMap<
+            Arc<Path>,
+            (
+                u64,
+                Entity<project::git_store::Repository>,
+                Entity<project::Project>,
+            ),
+        > = HashMap::new();
+        for workspace in &workspaces {
+            let project = workspace.read(cx).project().clone();
+            // Canonical counts require opening a buffer per changed file,
+            // which is too costly (and fragile across reconnects) for remote
+            // projects; those fall back to status-entry diff stats.
+            if !project.read(cx).is_local() {
+                continue;
+            }
+            for (repo, snapshot) in root_repositories(workspace, cx) {
+                current_repos
+                    .entry(snapshot.work_directory_abs_path.clone())
+                    .or_insert((snapshot.scan_id, repo, project.clone()));
+            }
+        }
+
+        self.repo_diff_totals
+            .retain(|work_dir, _| current_repos.contains_key(work_dir));
+
+        for (work_dir, (scan_id, repo, project)) in current_repos {
+            let is_current = self
+                .repo_diff_totals
+                .get(&work_dir)
+                .is_some_and(|totals| totals.scan_id == scan_id);
+            if is_current {
+                continue;
+            }
+
+            let counts_task =
+                git_ui::project_diff::uncommitted_changed_lines(&project, &repo, cx);
+            let previous_counts = self
+                .repo_diff_totals
+                .get(&work_dir)
+                .and_then(|totals| totals.counts);
+            let task = cx.spawn({
+                let work_dir = work_dir.clone();
+                async move |this, cx| {
+                    let counts = match counts_task.await {
+                        Ok(counts) => Some(counts),
+                        Err(error) => {
+                            log::error!(
+                                "failed to compute uncommitted diff stats for {work_dir:?}: {error:#}"
+                            );
+                            None
+                        }
+                    };
+                    this.update(cx, |this, cx| {
+                        if let Some(totals) = this.repo_diff_totals.get_mut(&work_dir)
+                            && totals.scan_id == scan_id
+                            && let Some(counts) = counts
+                            && totals.counts != Some(counts)
+                        {
+                            totals.counts = Some(counts);
+                            this.schedule_update_entries(false, cx);
+                        }
+                    })
+                    .ok();
+                }
+            });
+            self.repo_diff_totals.insert(
+                work_dir,
+                RepoDiffTotals {
+                    scan_id,
+                    counts: previous_counts,
+                    _task: Some(task),
+                },
+            );
+        }
     }
 
     /// Splices only the changed entry range, leaving unchanged item measurements intact.
@@ -3932,7 +4073,75 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut App,
     ) {
-        open_agent_thread_in_workspace(workspace, metadata, focus, window, cx);
+        fn load_thread(
+            agent_panel: Entity<AgentPanel>,
+            metadata: &ThreadMetadata,
+            focus: bool,
+            window: &mut Window,
+            cx: &mut App,
+        ) {
+            agent_panel.update(cx, |panel, cx| {
+                panel.load_agent_thread(
+                    Agent::from(metadata.agent_id.clone()),
+                    metadata.thread_id,
+                    Some(metadata.folder_paths().clone()),
+                    metadata.title.clone(),
+                    focus,
+                    AgentThreadSource::Sidebar,
+                    window,
+                    cx,
+                );
+            });
+        }
+
+        fn reveal_agent_panel(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+            workspace.reveal_panel::<AgentPanel>(window, cx);
+            // `reveal_panel` activates the hosted panel-pane item and returns
+            // before touching the dock, but dock open state is what gets
+            // persisted (and what legacy visibility checks read) — keep it in
+            // sync. Docks hosting pane-backed panels are never rendered, so
+            // this cannot double-mount the panel.
+            let docks: Vec<_> = workspace.all_docks().into_iter().cloned().collect();
+            for dock in docks {
+                let hosts_agent_panel = dock
+                    .read(cx)
+                    .panel_index_for_type::<AgentPanel>()
+                    .is_some();
+                if hosts_agent_panel && !dock.read(cx).is_open() {
+                    dock.update(cx, |dock, cx| dock.set_open(true, window, cx));
+                }
+            }
+        }
+
+        if let Some(panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
+            load_thread(panel, metadata, focus, window, cx);
+            workspace.update(cx, |workspace, cx| {
+                reveal_agent_panel(workspace, window, cx);
+            });
+            return;
+        }
+
+        // Sidebar-driven activations can target a workspace that was just
+        // created (e.g. unarchiving into a new project group), which has no
+        // agent panel yet — bootstrap one before loading the thread.
+        let workspace = workspace.downgrade();
+        let metadata = metadata.clone();
+        let mut async_window_cx = window.to_async(cx);
+        cx.spawn(async move |_cx| {
+            let panel = AgentPanel::load(workspace.clone(), async_window_cx.clone()).await?;
+
+            workspace.update_in(&mut async_window_cx, |workspace, window, cx| {
+                let panel = workspace.panel::<AgentPanel>(cx).unwrap_or_else(|| {
+                    workspace.add_panel(panel.clone(), window, cx);
+                    panel.clone()
+                });
+                load_thread(panel, &metadata, focus, window, cx);
+                reveal_agent_panel(workspace, window, cx);
+            })?;
+
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn open_closed_native_thread_as_markdown(

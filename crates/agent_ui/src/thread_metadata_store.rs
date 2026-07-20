@@ -1280,13 +1280,18 @@ impl ThreadMetadataStore {
             return;
         };
 
-        let is_draft = view.is_draft(cx);
         let thread_ref = thread.read(cx);
         // Collab-hosted threads don't own their metadata locally.
         if thread_ref.project().read(cx).is_via_collab() {
             return;
         }
         let existing_thread = self.entry(thread_id);
+
+        // A row that was already promoted (e.g. saved externally with a
+        // session id) must never be demoted back to a sessionless draft,
+        // even if the view still considers itself a draft because no user
+        // prompt was submitted through it.
+        let is_draft = view.is_draft(cx) && existing_thread.is_none_or(|t| t.is_draft());
 
         // New ACP sessions exist before the user sends. Keep draft metadata
         // sessionless until the conversation is promoted by user input.
@@ -1295,7 +1300,16 @@ impl ThreadMetadataStore {
         } else {
             Some(thread_ref.session_id().clone())
         };
-        let title = if is_draft { None } else { thread_ref.title() };
+        // Preserve an externally saved title when the live thread has not
+        // produced one of its own yet; titles never organically revert to
+        // None, so dropping the stored one would only lose information.
+        let title = if is_draft {
+            None
+        } else {
+            thread_ref
+                .title()
+                .or_else(|| existing_thread.and_then(|t| t.title.clone()))
+        };
         let title_override = existing_thread.and_then(|t| t.title_override.clone());
 
         let updated_at = Utc::now();

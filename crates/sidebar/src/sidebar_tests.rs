@@ -9060,14 +9060,13 @@ async fn test_linked_worktree_threads_not_duplicated_across_groups(cx: &mut Test
 
     // The thread should appear only under [project] (the dedicated
     // group for the /project repo), not under [other, project]. The
-    // multi-root workspace's panel mirrors its active new-draft view as a
-    // placeholder row, which is unrelated to the deduplication under test.
+    // multi-root workspace's panel stays uninitialized (no draft is
+    // created until the user focuses it), so its group renders empty.
     assert_eq!(
         visible_entries_as_strings(&sidebar, cx),
         vec![
             //
             "v [other, project]",
-            "  New Zed Agent Thread",
             "v [project]",
             "  Worktree Thread {wt-feature-a}",
         ]
@@ -14971,6 +14970,8 @@ async fn test_project_header_shows_branch_and_diff_stats(cx: &mut TestAppContext
     cx.run_until_parked();
 
     sidebar.update_in(cx, |sidebar, _window, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+    sidebar.update_in(cx, |sidebar, _window, cx| sidebar.update_entries(cx));
     sidebar.read_with(cx, |sidebar, _cx| {
         let git_info = sidebar
             .contents
@@ -14986,14 +14987,91 @@ async fn test_project_header_shows_branch_and_diff_stats(cx: &mut TestAppContext
             Some("main"),
             "project row should show the current branch"
         );
-        // The fake git backend reports whole-file line counts for modified
-        // files: worktree has 3 lines, head has 1.
+        // Canonical uncommitted diff counts: head has "one\n", the worktree
+        // has "one\ntwo\nthree\n" — two added rows, none removed.
         assert_eq!(
             (git_info.lines_added, git_info.lines_removed),
-            (3, 1),
+            (2, 0),
             "project row should sum uncommitted +/- line stats"
         );
     });
+}
+
+#[gpui::test]
+async fn test_project_header_diff_stats_match_uncommitted_changed_lines(cx: &mut TestAppContext) {
+    // §8 agreement: the sidebar's per-project +/- counts must equal the
+    // canonical counts from `git_ui::project_diff::uncommitted_changed_lines`,
+    // which is the same quantity the Uncommitted Diff view displays.
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    // a.txt: one line changed, two lines added.
+    // b.txt: untracked, two lines added.
+    // c.txt: deleted, three lines removed.
+    fs.insert_tree(
+        "/project",
+        serde_json::json!({
+            ".git": {},
+            "a.txt": "one\nTWO\nthree\nfour\nfive\n",
+            "b.txt": "x\ny\n",
+        }),
+    )
+    .await;
+    fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+    fs.set_head_and_index_for_repo(
+        Path::new("/project/.git"),
+        &[
+            ("a.txt", "one\ntwo\nthree\n".to_owned()),
+            ("c.txt", "p\nq\nr\n".to_owned()),
+        ],
+    );
+    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+
+    let project = project::Project::test(fs.clone(), ["/project".as_ref()], cx).await;
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    cx.run_until_parked();
+
+    sidebar.update_in(cx, |sidebar, _window, cx| sidebar.update_entries(cx));
+    cx.run_until_parked();
+    sidebar.update_in(cx, |sidebar, _window, cx| sidebar.update_entries(cx));
+
+    let sidebar_counts = sidebar.read_with(cx, |sidebar, _cx| {
+        let git_info = sidebar
+            .contents
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                ListEntry::ProjectHeader { git_info, .. } => Some(git_info.clone()),
+                _ => None,
+            })
+            .expect("project header should be present");
+        (git_info.lines_added, git_info.lines_removed)
+    });
+
+    let repo = project
+        .read_with(cx, |project, cx| project.active_repository(cx))
+        .expect("project should have an active repository");
+    let canonical_counts = cx
+        .update(|_window, cx| {
+            git_ui::project_diff::uncommitted_changed_lines(&project, &repo, cx)
+        })
+        .await
+        .expect("canonical diffstat should compute");
+
+    assert_eq!(
+        canonical_counts,
+        (5, 4),
+        "fixture should produce the expected canonical counts"
+    );
+    assert_eq!(
+        sidebar_counts, canonical_counts,
+        "sidebar project group +/- counts must match the Uncommitted Diff view's counts"
+    );
 }
 
 #[gpui::test]

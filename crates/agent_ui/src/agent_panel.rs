@@ -101,6 +101,7 @@ use workspace::{
     SerializedPathList, ToggleSidebar, ToggleZoom, ToolbarItemView, Workspace, WorkspaceId,
     dock::{DockPosition, Panel, PanelEvent},
     item::{ItemEvent, ItemHandle},
+    panel_pane::PanelItem,
 };
 
 const AGENT_PANEL_KEY: &str = "agent_panel";
@@ -1506,7 +1507,7 @@ impl AgentPanel {
         })
     }
 
-    pub(crate) fn new(workspace: &Workspace, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let fs = workspace.app_state().fs.clone();
         let user_store = workspace.app_state().user_store.clone();
         let project = workspace.project();
@@ -1578,6 +1579,16 @@ impl AgentPanel {
         })
         .detach();
 
+        // Create the initial draft/terminal lazily, on first user focus.
+        // Panels are activated programmatically when added to the panel
+        // pane, and initializing there would surface an unrequested draft
+        // in the sidebar and steal the active-entry highlight.
+        let focus_handle = cx.focus_handle();
+        cx.on_focus_in(&focus_handle, window, |this, window, cx| {
+            this.ensure_thread_initialized(window, cx);
+        })
+        .detach();
+
         let panel = Self {
             workspace_id,
             base_view,
@@ -1588,7 +1599,7 @@ impl AgentPanel {
             fs: fs.clone(),
             language_registry,
             connection_store,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             context_server_registry,
             draft_thread: None,
             retained_threads: HashMap::default(),
@@ -1784,18 +1795,30 @@ impl AgentPanel {
     pub fn is_visible(workspace: &Entity<Workspace>, cx: &App) -> bool {
         let workspace_read = workspace.read(cx);
 
-        workspace_read
-            .panel::<AgentPanel>(cx)
-            .map(|panel| {
-                let panel_id = Entity::entity_id(&panel);
+        let Some(panel) = workspace_read.panel::<AgentPanel>(cx) else {
+            return false;
+        };
+        let panel_id = Entity::entity_id(&panel);
 
-                workspace_read.all_docks().iter().any(|dock| {
-                    dock.read(cx)
-                        .visible_panel()
-                        .is_some_and(|visible_panel| visible_panel.panel_id() == panel_id)
-                })
+        let visible_in_dock = workspace_read.all_docks().iter().any(|dock| {
+            dock.read(cx)
+                .visible_panel()
+                .is_some_and(|visible_panel| visible_panel.panel_id() == panel_id)
+        });
+        if visible_in_dock {
+            return true;
+        }
+
+        workspace_read
+            .panel_pane_for_kind(PaneKind::Agent, cx)
+            .is_some_and(|pane| {
+                let pane = pane.read(cx);
+                pane.is_visible()
+                    && pane.active_item().is_some_and(|item| {
+                        item.downcast::<PanelItem>()
+                            .is_some_and(|panel_item| panel_item.read(cx).panel_id() == panel_id)
+                    })
             })
-            .unwrap_or(false)
     }
 
     /// Clear the active view, retaining any running thread in the background.
@@ -5052,7 +5075,7 @@ impl Panel for AgentPanel {
 
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.is_active = active;
-        if active {
+        if active && self.focus_handle(cx).contains_focused(window, cx) {
             self.ensure_thread_initialized(window, cx);
         }
     }
@@ -7445,6 +7468,9 @@ mod tests {
 
         panel.update_in(&mut cx, |panel, window, cx| {
             panel.last_created_entry_kind = AgentPanelEntryKind::Terminal;
+            // Initialization requires user focus; programmatic activation
+            // alone must not create the initial entry.
+            panel.focus_handle(cx).focus(window, cx);
             panel.set_active(true, window, cx);
             panel.set_active(true, window, cx);
         });
@@ -7745,6 +7771,9 @@ mod tests {
             workspace.add_panel(loaded.clone(), window, cx);
         });
         loaded.update_in(cx, |panel, window, cx| {
+            // Initialization requires user focus; programmatic activation
+            // alone must not create the initial entry.
+            panel.focus_handle(cx).focus(window, cx);
             panel.set_active(true, window, cx);
         });
         for _ in 0..8 {
@@ -7970,6 +7999,7 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
         fs.insert_tree("/project", json!({ "file.txt": "" })).await;
         let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
 
@@ -8060,6 +8090,7 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
         fs.insert_tree("/project_a", json!({ "file.txt": "" }))
             .await;
         fs.insert_tree("/project_b", json!({ "file.txt": "" }))
@@ -8638,6 +8669,7 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
         fs.insert_tree("/project", json!({ "file.txt": "" })).await;
         let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
 
@@ -8867,6 +8899,7 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
         fs.insert_tree("/project", json!({ "file.txt": "" })).await;
         let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
 
@@ -9042,6 +9075,7 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
         fs.insert_tree(
             "/project",
             json!({ "file.rs": "line one\nline two\nline three\n" }),
@@ -10417,12 +10451,26 @@ mod tests {
                 .workspace()
                 .clone()
         });
-        workspace.update_in(&mut cx, |workspace, window, cx| {
-            workspace.focus_handle(cx).focus(window, cx);
+        // Focusing the workspace's own focus handle would land on the active
+        // pane, which still hosts the agent panel item; move focus to the
+        // tabbed center pane instead so the panel loses focus.
+        let center_pane = workspace.read_with(&cx, |workspace, cx| {
+            workspace
+                .panel_pane_for_kind(PaneKind::Tabs, cx)
+                .expect("workspace should have a tabbed center pane")
         });
+        center_pane.update_in(&mut cx, |pane, window, cx| {
+            pane.focus_handle(cx).focus(window, cx);
+        });
+        cx.run_until_parked();
         cx.update(|window, cx| {
             assert!(window.is_window_active());
-            assert!(workspace.read(cx).focus_handle(cx).is_focused(window));
+            assert!(
+                center_pane
+                    .read(cx)
+                    .focus_handle(cx)
+                    .contains_focused(window, cx)
+            );
             assert!(!panel.read(cx).focus_handle(cx).contains_focused(window, cx));
         });
 
@@ -10546,6 +10594,18 @@ mod tests {
     #[gpui::test]
     async fn test_terminal_notification_dismissed_when_sidebar_opens(cx: &mut TestAppContext) {
         let (panel, mut cx) = setup_visible_panel(cx).await;
+        // The sidebar starts open by default; this test needs it closed so the
+        // bell pops up a notification that opening the sidebar can dismiss.
+        cx.update(|window, cx| {
+            let multi_workspace = window
+                .root::<MultiWorkspace>()
+                .flatten()
+                .expect("test window should have a MultiWorkspace root");
+            multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace.close_sidebar(window, cx);
+            });
+        });
+        cx.run_until_parked();
         let first_terminal_id = panel
             .update_in(&mut cx, |panel, window, cx| {
                 panel.insert_test_terminal("Build", true, window, cx)
@@ -10817,6 +10877,7 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
         fs.insert_tree("/project_a", json!({ "file.txt": "" }))
             .await;
         fs.insert_tree("/project_b", json!({ "file.txt": "" }))
@@ -11810,6 +11871,7 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
         fs.insert_tree("/project", json!({ "file.txt": "" })).await;
         let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
 
@@ -12316,8 +12378,18 @@ mod tests {
         // into `retained_threads` (keeping the user's prompt accessible
         // from the sidebar) and a fresh empty draft on the new agent
         // should become active.
-        cx.dispatch_action(NewExternalAgentThread {
-            agent: Agent::Stub.id(),
+        // Invoke the panel handler directly: dispatching the action at the
+        // window level now routes to the workspace handler, which creates an
+        // AgentThreadItem in the center pane instead of touching the panel's
+        // draft slot under test here.
+        panel.update_in(cx, |panel, window, cx| {
+            panel.new_external_agent_thread(
+                &NewExternalAgentThread {
+                    agent: Agent::Stub.id(),
+                },
+                window,
+                cx,
+            );
         });
         cx.run_until_parked();
 
@@ -12846,6 +12918,7 @@ mod tests {
 
         // Create a project with a file so we have a buffer in the center pane.
         let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
         fs.insert_tree("/project", json!({ "file.txt": "hello world" }))
             .await;
         let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
@@ -13306,6 +13379,7 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
         fs.insert_tree("/project_a", json!({ "file.txt": "" }))
             .await;
         fs.insert_tree("/project_b", json!({ "file.txt": "" }))
@@ -13400,6 +13474,7 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
         fs.insert_tree("/project_a", json!({ "file.txt": "" }))
             .await;
         fs.insert_tree("/project_b", json!({ "file.txt": "" }))
@@ -13432,10 +13507,11 @@ mod tests {
             panel.selected_agent = Agent::Stub;
         });
 
+        // Do not add the panel to the workspace yet: adding it to the panel
+        // pane activates it, which eagerly initializes a draft thread. This
+        // test needs a genuinely fresh (never-activated) destination panel.
         let panel_b = workspace_b.update_in(cx, |workspace, window, cx| {
-            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
-            workspace.add_panel(panel.clone(), window, cx);
-            panel
+            cx.new(|cx| AgentPanel::new(workspace, window, cx))
         });
 
         let initialized = panel_b.update_in(cx, |panel, window, cx| {
@@ -13556,6 +13632,7 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
         fs.insert_tree("/project_a", json!({ "file.txt": "" }))
             .await;
         fs.insert_tree("/project_b", json!({ "file.txt": "" }))
