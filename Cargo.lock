@@ -370,6 +370,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent_detect"
+version = "0.1.0"
+dependencies = [
+ "regex",
+]
+
+[[package]]
 name = "agent_servers"
 version = "0.1.0"
 dependencies = [
