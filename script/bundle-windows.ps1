@@ -13,6 +13,7 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 
 $buildSuccess = $false
+$canCodeSign = $false
 
 $OSArchitecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
     "X64" { "x86_64" }
@@ -39,8 +40,17 @@ function Get-VSArch {
     }
 }
 
+# Locate Visual Studio via vswhere: GitHub-hosted runners ship Enterprise, local
+# machines typically Community, so the edition can't be hardcoded.
+$vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$vsDevShell = if (Test-Path $vsWhere) {
+    $vsRoot = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    "$vsRoot\Common7\Tools\Launch-VsDevShell.ps1"
+} else {
+    "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1"
+}
 Push-Location
-& "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
+& $vsDevShell -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
 Pop-Location
 
 $target = "$Architecture-pc-windows-msvc"
@@ -66,18 +76,31 @@ function CheckEnvironmentVariables {
         return
     }
 
-    $requiredVars = @(
-        'ZED_WORKSPACE', 'RELEASE_VERSION', 'ZED_RELEASE_CHANNEL',
+    $requiredVars = @('ZED_WORKSPACE', 'RELEASE_VERSION', 'ZED_RELEASE_CHANNEL')
+
+    foreach ($var in $requiredVars) {
+        if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($var))) {
+            Write-Error "$var is not set"
+            exit 1
+        }
+    }
+
+    # On PRs from forks the signing secrets are not populated,
+    # so skip code signing instead of failing, like bundle-mac does.
+    $signingVars = @(
         'AZURE_TENANT_ID', 'AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET',
         'ACCOUNT_NAME', 'CERT_PROFILE_NAME', 'ENDPOINT',
         'FILE_DIGEST', 'TIMESTAMP_DIGEST', 'TIMESTAMP_SERVER'
     )
 
-    foreach ($var in $requiredVars) {
-        if (-not (Test-Path "env:$var")) {
-            Write-Error "$var is not set"
-            exit 1
-        }
+    $missingVars = @($signingVars | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
+    if ($missingVars.Count -eq 0) {
+        $script:canCodeSign = $true
+    } else {
+        Write-Host "====== WARNING ======"
+        Write-Host "One or more of the following variables are missing: $($missingVars -join ', ')"
+        Write-Host "This bundle will not be code signed"
+        Write-Host "====== WARNING ======"
     }
 }
 
@@ -103,7 +126,8 @@ function BuildZedAndItsFriends {
     Write-Output "Building Zed and its friends, for channel: $channel"
     # Build zed.exe, cli.exe and auto_update_helper.exe
     cargo build --release --package zed --package cli --package auto_update_helper --target $target
-    Copy-Item -Path ".\$CargoOutDir\zed.exe" -Destination "$innoDir\Zed.exe" -Force
+    # The zed package's binary is named `superzed` in this fork.
+    Copy-Item -Path ".\$CargoOutDir\superzed.exe" -Destination "$innoDir\Zed.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\cli.exe" -Destination "$innoDir\cli.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\auto_update_helper.exe" -Destination "$innoDir\auto_update_helper.exe" -Force
     # Build explorer_command_injector.dll
@@ -128,7 +152,7 @@ function BuildRemoteServer {
     # Create zipped remote server binary
     $remoteServerSrc = (Resolve-Path ".\$CargoOutDir\remote_server.exe").Path
 
-    if ($env:CI) {
+    if ($canCodeSign) {
         Write-Output "Code signing remote_server.exe"
         & "$innoDir\sign.ps1" $remoteServerSrc
     }
@@ -141,15 +165,21 @@ function BuildRemoteServer {
 }
 
 function ZipZedAndItsFriendsDebug {
+    # Builds with debuginfo disabled (e.g. CARGO_PROFILE_RELEASE_DEBUG=0 on CI)
+    # produce no .pdb files; skip the archive instead of failing.
     $items = @(
-        ".\$CargoOutDir\zed.pdb",
+        ".\$CargoOutDir\superzed.pdb",
         ".\$CargoOutDir\cli.pdb",
         ".\$CargoOutDir\auto_update_helper.pdb",
         ".\$CargoOutDir\explorer_command_injector.pdb",
         ".\$CargoOutDir\remote_server.pdb"
-    )
+    ) | Where-Object { Test-Path $_ }
 
-    Compress-Archive -Path $items -DestinationPath ".\$CargoOutDir\zed-$env:RELEASE_VERSION-$env:ZED_RELEASE_CHANNEL.dbg.zip" -Force
+    if ($items.Count -gt 0) {
+        Compress-Archive -Path $items -DestinationPath ".\$CargoOutDir\zed-$env:RELEASE_VERSION-$env:ZED_RELEASE_CHANNEL.dbg.zip" -Force
+    } else {
+        Write-Output "No .pdb files found; skipping debug symbol archive"
+    }
 }
 
 
@@ -159,7 +189,7 @@ function UploadToSentry {
         Write-Output "install with: 'winget install -e --id=Sentry.sentry-cli'"
         return
     }
-    if (-not (Test-Path "env:SENTRY_AUTH_TOKEN")) {
+    if ([string]::IsNullOrWhiteSpace($env:SENTRY_AUTH_TOKEN)) {
         Write-Output "missing SENTRY_AUTH_TOKEN. skipping sentry upload."
         return
     }
@@ -193,14 +223,19 @@ function MakeAppx {
         }
     }
     Copy-Item -Path "$manifestFile" -Destination "$innoDir\make_appx\AppxManifest.xml"
-    # Add makeAppx.exe to Path
+    # Add makeAppx.exe to Path, falling back to the newest installed SDK when
+    # the pinned version is absent (GitHub-hosted runner images vary).
     $sdk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64"
+    if (-not (Test-Path "$sdk\makeappx.exe")) {
+        $sdk = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\10.0.*\x64\makeappx.exe" |
+            Sort-Object FullName | Select-Object -Last 1 | ForEach-Object { $_.DirectoryName }
+    }
     $env:Path += ';' + $sdk
     makeAppx.exe pack /d "$innoDir\make_appx" /p "$innoDir\zed_explorer_command_injector.appx" /nv
 }
 
 function SignZedAndItsFriends {
-    if (-not $env:CI) {
+    if (-not $canCodeSign) {
         return
     }
 
@@ -340,7 +375,9 @@ function BuildInstaller {
     }
 
     $innoArgs = @($issFilePath) + $defs
-    if($env:CI) {
+    if($canCodeSign) {
+        # Checked by zed.iss to decide whether to sign the installer.
+        $env:ZED_SIGN_BUNDLE = "1"
         $signTool = "powershell.exe -ExecutionPolicy Bypass -File $innoDir\sign.ps1 `$f"
         $innoArgs += "/sDefaultsign=`"$signTool`""
     }

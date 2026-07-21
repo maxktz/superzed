@@ -35,10 +35,8 @@ pub fn init(client: Arc<Client>, user_store: Entity<UserStore>, cx: &mut App) {
             return;
         };
 
-        let active_call_handle = active_call_handle.clone();
-        cx.subscribe_in(
-            &cx.entity(),
-            window,
+        cx.subscribe_in(&cx.entity(), window, {
+            let active_call_handle = active_call_handle.clone();
             move |multi_workspace, _, event: &MultiWorkspaceEvent, window, cx| {
                 if !matches!(event, MultiWorkspaceEvent::ActiveWorkspaceChanged { .. })
                     && window.is_window_active()
@@ -52,8 +50,33 @@ pub fn init(client: Arc<Client>, user_store: Entity<UserStore>, cx: &mut App) {
                 }) {
                     task.detach_and_log_err(cx);
                 }
-            },
-        )
+            }
+        })
+        .detach();
+
+        // The user's call location used to be maintained by the per-workspace
+        // `TitleBar` (which observed window activation), but the title bar
+        // chrome moved into the sidebar and is no longer created for every
+        // window, so track window activation here instead.
+        cx.observe_window_activation(window, {
+            let active_call_handle = active_call_handle.clone();
+            move |multi_workspace, window, cx| {
+                let task = if window.is_window_active() {
+                    let project = multi_workspace.workspace().read(cx).project().clone();
+                    active_call_handle.update(cx, |active_call, cx| {
+                        active_call.set_location(Some(&project), cx)
+                    })
+                } else if cx.active_window().is_none() {
+                    active_call_handle
+                        .update(cx, |active_call, cx| active_call.set_location(None, cx))
+                } else {
+                    return;
+                };
+                if let Ok(task) = task {
+                    task.detach_and_log_err(cx);
+                }
+            }
+        })
         .detach();
     })
     .detach();

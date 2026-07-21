@@ -1985,6 +1985,18 @@ async fn test_breakpoint_jumps_only_in_proper_split_view(
         })
         .unwrap();
 
+    // The debug panel opens as an item in the active pane, so give it a
+    // dedicated pane first to keep panes A and B showing only editors.
+    let debug_panel_pane = workspace
+        .update(cx, |multi, window, cx| {
+            multi.workspace().update(cx, |workspace, cx| {
+                workspace.split_pane(pane_b.clone(), SplitDirection::Down, window, cx)
+            })
+        })
+        .unwrap();
+
+    cx.run_until_parked();
+
     // Start a debug session and trigger a breakpoint stop on main.rs line 2
     let session = start_debug_session(&workspace, cx, |_| {}).unwrap();
     let client = session.update(cx, |session, _| session.adapter_client().unwrap());
@@ -2047,6 +2059,19 @@ async fn test_breakpoint_jumps_only_in_proper_split_view(
         .await;
 
     cx.run_until_parked();
+
+    // Sanity check: the debug panel landed in its dedicated pane.
+    workspace
+        .read_with(cx, |_multi, cx| {
+            assert!(
+                debug_panel_pane
+                    .read(cx)
+                    .items()
+                    .any(|item| item.downcast::<DebugPanel>().is_some()),
+                "Debug panel should be hosted in its dedicated pane",
+            );
+        })
+        .unwrap();
 
     // After first breakpoint stop on main.rs:
     // Pane A should still have second.rs as its active item because

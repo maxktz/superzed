@@ -1,3 +1,30 @@
+# superzed (Zed fork)
+
+> **NOTE (trademark):** "superzed" derives from the Zed name and may carry
+> trademark/DMCA risk. A rename is deliberately deferred — do not invest in
+> the name.
+
+This is a fork of [Zed](https://zed.dev) that reorients the editor around
+agents. Where it diverges from upstream Zed:
+
+- **Sidebar** (`crates/sidebar`): a Workspaces panel (projects with git
+  branch and uncommitted `+/-` diff stats) and a Chats panel (agent threads
+  with relative age, agent label, and status filters) replace the title bar
+  and bottom dock.
+- **Multi-workspace windows** (`crates/workspace/src/multi_workspace.rs`):
+  one window hosts N workspaces grouped by worktree ("project groups") with
+  quick project/thread switching (`NextProject`/`NextThread` and
+  cmd/ctrl-click).
+- **Agent-first threads** (`crates/agent_ui`): threads are first-class tabs
+  with explicit run states — Running, parked-on-human (awaiting
+  confirmation/input), Idle — plus process-liveness detection, and a chat
+  header showing harness · model · cwd.
+- **Persistent terminals**: terminal threads persist across restarts via
+  sidebar terminal-thread metadata instead of a terminal dock panel.
+- The bottom dock and title bar are removed; panes render as rounded cards.
+
+Upstream README follows.
+
 # Zed
 
 [![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)

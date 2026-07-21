@@ -239,6 +239,50 @@ impl ThreadSwitcher {
         self.entries.get(self.selected_index)
     }
 
+    /// Refreshes each entry in place from a freshly built entry list so that
+    /// status, title, and diff-stat changes that happen while the switcher is
+    /// open propagate into its rendered thread items. The switcher's ordering
+    /// and selection are deliberately left untouched: reordering mid-cycle
+    /// would make ctrl-tab land on the wrong thread.
+    pub fn sync_entries(&mut self, fresh_entries: &[ThreadSwitcherEntry], cx: &mut Context<Self>) {
+        let mut changed = false;
+        for entry in &mut self.entries {
+            match entry {
+                ThreadSwitcherEntry::Thread(existing) => {
+                    let fresh = fresh_entries.iter().find_map(|fresh| match fresh {
+                        ThreadSwitcherEntry::Thread(fresh)
+                            if fresh.metadata.thread_id == existing.metadata.thread_id =>
+                        {
+                            Some(fresh)
+                        }
+                        _ => None,
+                    });
+                    if let Some(fresh) = fresh {
+                        *existing = fresh.clone();
+                        changed = true;
+                    }
+                }
+                ThreadSwitcherEntry::Terminal(existing) => {
+                    let fresh = fresh_entries.iter().find_map(|fresh| match fresh {
+                        ThreadSwitcherEntry::Terminal(fresh)
+                            if fresh.metadata.terminal_id == existing.metadata.terminal_id =>
+                        {
+                            Some(fresh)
+                        }
+                        _ => None,
+                    });
+                    if let Some(fresh) = fresh {
+                        *existing = fresh.clone();
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
     #[cfg(test)]
     pub fn entries(&self) -> &[ThreadSwitcherEntry] {
         &self.entries
@@ -407,7 +451,6 @@ impl Render for ThreadSwitcher {
                                     this.select_index(ix, cx);
                                 }
                             }))
-                            // TODO: This is not properly propagating to the tread item.
                             .on_click(cx.listener(
                                 move |this, _event: &gpui::ClickEvent, _window, cx| {
                                     this.select_and_confirm(ix, cx);

@@ -1,10 +1,10 @@
-use crate::AcpThread;
+use crate::{AcpThread, ElicitationStore};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use collections::{HashMap, HashSet, IndexMap};
 use gpui::{Entity, SharedString, Task};
-use language_model::{DisabledReason, LanguageModelProviderId};
+use language_model::DisabledReason;
 use project::{AgentId, Project};
 use serde::{Deserialize, Serialize};
 use std::{any::Any, error::Error, fmt, path::PathBuf, rc::Rc};
@@ -95,6 +95,13 @@ pub trait AgentConnection {
 
     fn agent_version(&self) -> Option<SharedString> {
         None
+    }
+
+    /// Whether the agent server process behind this connection (if any) is
+    /// still running. Connections that are not backed by a subprocess always
+    /// report `true`.
+    fn server_alive(&self) -> bool {
+        true
     }
 
     fn new_session(
@@ -200,6 +207,13 @@ pub trait AgentConnection {
     }
 
     fn cancel(&self, session_id: &acp::SessionId, cx: &mut App);
+
+    /// Request-scoped elicitations are connection-level because they can arrive before a session
+    /// thread exists. Session-scoped elicitations stay in the thread timeline, but use
+    /// `ElicitationStore` for shared processing.
+    fn request_elicitations(&self) -> Option<Entity<ElicitationStore>> {
+        None
+    }
 
     fn truncate(
         &self,
@@ -414,24 +428,15 @@ impl dyn AgentSessionList {
 #[derive(Debug)]
 pub struct AuthRequired {
     pub description: Option<String>,
-    pub provider_id: Option<LanguageModelProviderId>,
 }
 
 impl AuthRequired {
     pub fn new() -> Self {
-        Self {
-            description: None,
-            provider_id: None,
-        }
+        Self { description: None }
     }
 
     pub fn with_description(mut self, description: String) -> Self {
         self.description = Some(description);
-        self
-    }
-
-    pub fn with_language_model_provider(mut self, provider_id: LanguageModelProviderId) -> Self {
-        self.provider_id = Some(provider_id);
         self
     }
 }
@@ -763,6 +768,7 @@ mod test_support {
         supports_session_additional_directories: bool,
         agent_id: AgentId,
         telemetry_id: SharedString,
+        server_alive: Arc<std::sync::atomic::AtomicBool>,
     }
 
     struct Session {
@@ -786,7 +792,14 @@ mod test_support {
                 supports_session_additional_directories: false,
                 agent_id: AgentId::new("stub"),
                 telemetry_id: "stub".into(),
+                server_alive: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             }
+        }
+
+        /// Simulates the agent server process dying (or coming back) so tests
+        /// can exercise liveness-dependent UI states.
+        pub fn set_server_alive(&self, alive: bool) {
+            self.server_alive.store(alive, Ordering::SeqCst);
         }
 
         pub fn set_next_prompt_updates(&self, updates: Vec<acp::SessionUpdate>) {
@@ -905,6 +918,10 @@ mod test_support {
             self.telemetry_id.clone()
         }
 
+        fn server_alive(&self) -> bool {
+            self.server_alive.load(Ordering::SeqCst)
+        }
+
         fn auth_methods(&self) -> &[acp::AuthMethod] {
             &[]
         }
@@ -956,7 +973,9 @@ mod test_support {
             _method_id: acp::AuthMethodId,
             _cx: &mut App,
         ) -> Task<gpui::Result<()>> {
-            unimplemented!()
+            Task::ready(Err(anyhow::anyhow!(
+                "StubAgentConnection has no auth methods"
+            )))
         }
 
         fn prompt(

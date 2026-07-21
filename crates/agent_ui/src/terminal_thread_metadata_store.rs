@@ -53,6 +53,12 @@ pub struct TerminalThreadMetadata {
     pub worktree_paths: WorktreePaths,
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub working_directory: Option<PathBuf>,
+    /// Label of the agent CLI last detected in this terminal ("claude",
+    /// "codex"), used to relaunch it on restore.
+    pub agent: Option<String>,
+    /// The agent's captured session reference, used to resume the
+    /// conversation on restore.
+    pub agent_session: Option<String>,
 }
 
 impl TerminalThreadMetadata {
@@ -194,7 +200,17 @@ impl TerminalThreadMetadataStore {
     }
 
     pub fn entries(&self) -> impl Iterator<Item = &TerminalThreadMetadata> + '_ {
-        self.terminals.values()
+        Self::sorted_by_created_at(self.terminals.values().collect())
+    }
+
+    // The in-memory indices are hash-based, so without an explicit sort the
+    // iteration order (and therefore sidebar listing and restore order) would
+    // change between runs.
+    fn sorted_by_created_at(
+        mut entries: Vec<&TerminalThreadMetadata>,
+    ) -> impl Iterator<Item = &TerminalThreadMetadata> {
+        entries.sort_by_key(|metadata| (metadata.created_at, metadata.terminal_id));
+        entries.into_iter()
     }
 
     pub fn reload_task(&self) -> Shared<Task<()>> {
@@ -208,17 +224,20 @@ impl TerminalThreadMetadataStore {
         path_list: &PathList,
         remote_connection: Option<&'a RemoteConnectionOptions>,
     ) -> impl Iterator<Item = &'a TerminalThreadMetadata> + 'a {
-        self.terminals_by_paths
-            .get(path_list)
-            .into_iter()
-            .flatten()
-            .filter_map(|id| self.terminals.get(id))
-            .filter(move |terminal| {
-                same_remote_connection_identity(
-                    terminal.remote_connection.as_ref(),
-                    remote_connection,
-                )
-            })
+        Self::sorted_by_created_at(
+            self.terminals_by_paths
+                .get(path_list)
+                .into_iter()
+                .flatten()
+                .filter_map(|id| self.terminals.get(id))
+                .filter(|terminal| {
+                    same_remote_connection_identity(
+                        terminal.remote_connection.as_ref(),
+                        remote_connection,
+                    )
+                })
+                .collect(),
+        )
     }
 
     pub fn entries_for_main_worktree_path<'a>(
@@ -226,17 +245,20 @@ impl TerminalThreadMetadataStore {
         path_list: &PathList,
         remote_connection: Option<&'a RemoteConnectionOptions>,
     ) -> impl Iterator<Item = &'a TerminalThreadMetadata> + 'a {
-        self.terminals_by_main_paths
-            .get(path_list)
-            .into_iter()
-            .flatten()
-            .filter_map(|id| self.terminals.get(id))
-            .filter(move |terminal| {
-                same_remote_connection_identity(
-                    terminal.remote_connection.as_ref(),
-                    remote_connection,
-                )
-            })
+        Self::sorted_by_created_at(
+            self.terminals_by_main_paths
+                .get(path_list)
+                .into_iter()
+                .flatten()
+                .filter_map(|id| self.terminals.get(id))
+                .filter(|terminal| {
+                    same_remote_connection_identity(
+                        terminal.remote_connection.as_ref(),
+                        remote_connection,
+                    )
+                })
+                .collect(),
+        )
     }
 
     pub fn path_is_referenced_by_terminal(
@@ -445,20 +467,26 @@ struct TerminalThreadMetadataDb(ThreadSafeConnection);
 impl Domain for TerminalThreadMetadataDb {
     const NAME: &str = stringify!(TerminalThreadMetadataDb);
 
-    const MIGRATIONS: &[&str] = &[sql!(
-        CREATE TABLE IF NOT EXISTS sidebar_terminal_threads(
-            terminal_id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            custom_title TEXT,
-            created_at TEXT NOT NULL,
-            working_directory TEXT,
-            folder_paths TEXT,
-            folder_paths_order TEXT,
-            main_worktree_paths TEXT,
-            main_worktree_paths_order TEXT,
-            remote_connection TEXT
-        ) STRICT;
-    )];
+    const MIGRATIONS: &[&str] = &[
+        sql!(
+            CREATE TABLE IF NOT EXISTS sidebar_terminal_threads(
+                terminal_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                custom_title TEXT,
+                created_at TEXT NOT NULL,
+                working_directory TEXT,
+                folder_paths TEXT,
+                folder_paths_order TEXT,
+                main_worktree_paths TEXT,
+                main_worktree_paths_order TEXT,
+                remote_connection TEXT
+            ) STRICT;
+        ),
+        sql!(
+            ALTER TABLE sidebar_terminal_threads ADD COLUMN agent TEXT;
+            ALTER TABLE sidebar_terminal_threads ADD COLUMN agent_session TEXT;
+        ),
+    ];
 }
 
 db::static_connection!(TerminalThreadMetadataDb, []);
@@ -468,7 +496,7 @@ impl TerminalThreadMetadataDb {
         self.select::<TerminalThreadMetadata>(
             "SELECT terminal_id, title, custom_title, created_at, \
             working_directory, folder_paths, folder_paths_order, main_worktree_paths, \
-            main_worktree_paths_order, remote_connection \
+            main_worktree_paths_order, remote_connection, agent, agent_session \
             FROM sidebar_terminal_threads \
             ORDER BY created_at DESC",
         )?()
@@ -502,10 +530,12 @@ impl TerminalThreadMetadataDb {
             .map(serde_json::to_string)
             .transpose()
             .context("serialize terminal thread remote connection")?;
+        let agent = row.agent.clone();
+        let agent_session = row.agent_session.clone();
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+            let sql = "INSERT INTO sidebar_terminal_threads(terminal_id, title, custom_title, created_at, working_directory, folder_paths, folder_paths_order, main_worktree_paths, main_worktree_paths_order, remote_connection, agent, agent_session) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
                        ON CONFLICT(terminal_id) DO UPDATE SET \
                            title = excluded.title, \
                            custom_title = excluded.custom_title, \
@@ -515,7 +545,9 @@ impl TerminalThreadMetadataDb {
                            folder_paths_order = excluded.folder_paths_order, \
                            main_worktree_paths = excluded.main_worktree_paths, \
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
-                           remote_connection = excluded.remote_connection";
+                           remote_connection = excluded.remote_connection, \
+                           agent = excluded.agent, \
+                           agent_session = excluded.agent_session";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&terminal_id, 1)?;
             i = stmt.bind(&title, i)?;
@@ -526,7 +558,9 @@ impl TerminalThreadMetadataDb {
             i = stmt.bind(&folder_paths_order, i)?;
             i = stmt.bind(&main_worktree_paths, i)?;
             i = stmt.bind(&main_worktree_paths_order, i)?;
-            stmt.bind(&remote_connection, i)?;
+            i = stmt.bind(&remote_connection, i)?;
+            i = stmt.bind(&agent, i)?;
+            stmt.bind(&agent_session, i)?;
             stmt.exec()
         })
         .await
@@ -562,6 +596,8 @@ impl Column for TerminalThreadMetadata {
             Column::column(statement, next)?;
         let (remote_connection_json, next): (Option<String>, i32) =
             Column::column(statement, next)?;
+        let (agent, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (agent_session, next): (Option<String>, i32) = Column::column(statement, next)?;
 
         let folder_paths = folder_paths_str
             .map(|paths| {
@@ -601,6 +637,8 @@ impl Column for TerminalThreadMetadata {
                 worktree_paths,
                 remote_connection,
                 working_directory: working_directory.map(PathBuf::from),
+                agent,
+                agent_session,
             },
             next,
         ))
@@ -630,6 +668,8 @@ mod tests {
             worktree_paths,
             remote_connection: None,
             working_directory: None,
+            agent: None,
+            agent_session: None,
         }
     }
 
@@ -657,6 +697,206 @@ mod tests {
 
         metadata.title = "Thinking".into();
         assert_eq!(metadata.display_title().as_ref(), "Fix bug");
+    }
+
+    async fn reload_store(cx: &mut TestAppContext) {
+        let reload_task = cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| store.reload(cx));
+            store.read(cx).reload_task()
+        });
+        reload_task.await;
+    }
+
+    #[gpui::test]
+    async fn test_save_and_reload_round_trip_preserves_metadata(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let folder_paths = PathList::new(&[Path::new("/repo")]);
+        let mut saved = metadata(
+            "Dev Server",
+            WorktreePaths::from_folder_paths(&folder_paths),
+        );
+        saved.custom_title = Some("Fix bug".into());
+        saved.working_directory = Some(PathBuf::from("/repo/src"));
+        saved.agent = Some("claude".to_string());
+        saved.agent_session = Some("11111111-2222-3333-4444-555555555555".to_string());
+        let terminal_id = saved.terminal_id;
+        let created_at = saved.created_at;
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(saved, cx);
+            });
+        });
+        cx.run_until_parked();
+        reload_store(cx).await;
+
+        cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            let entry = store
+                .entry(terminal_id)
+                .expect("entry should survive a reload from the database");
+            assert_eq!(entry.title.as_ref(), "Dev Server");
+            assert_eq!(entry.custom_title.as_deref(), Some("Fix bug"));
+            assert_eq!(entry.working_directory, Some(PathBuf::from("/repo/src")));
+            assert_eq!(entry.created_at, created_at);
+            assert_eq!(entry.folder_paths().paths(), folder_paths.paths());
+            assert_eq!(entry.agent.as_deref(), Some("claude"));
+            assert_eq!(
+                entry.agent_session.as_deref(),
+                Some("11111111-2222-3333-4444-555555555555")
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_working_directory_and_custom_title_updates_persist_across_reload(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let folder_paths = PathList::new(&[Path::new("/repo")]);
+        let mut saved = metadata(
+            "Dev Server",
+            WorktreePaths::from_folder_paths(&folder_paths),
+        );
+        saved.working_directory = Some(PathBuf::from("/repo"));
+        let terminal_id = saved.terminal_id;
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(saved.clone(), cx);
+            });
+        });
+        cx.run_until_parked();
+
+        saved.working_directory = Some(PathBuf::from("/repo/deep/dir"));
+        saved.custom_title = Some("Renamed".into());
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(saved, cx);
+            });
+        });
+        cx.run_until_parked();
+        reload_store(cx).await;
+
+        cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            let entry = store
+                .entry(terminal_id)
+                .expect("updated entry should survive a reload");
+            assert_eq!(
+                entry.working_directory,
+                Some(PathBuf::from("/repo/deep/dir"))
+            );
+            assert_eq!(entry.custom_title.as_deref(), Some("Renamed"));
+            assert_eq!(
+                store.entries_for_path(&folder_paths, None).count(),
+                1,
+                "an update must not create a second row"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_entries_are_ordered_by_created_at(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let folder_paths = PathList::new(&[Path::new("/repo")]);
+        let base = Utc::now();
+        let mut oldest = metadata("first", WorktreePaths::from_folder_paths(&folder_paths));
+        oldest.created_at = base - chrono::Duration::seconds(60);
+        let mut middle = metadata("second", WorktreePaths::from_folder_paths(&folder_paths));
+        middle.created_at = base;
+        let mut newest = metadata("third", WorktreePaths::from_folder_paths(&folder_paths));
+        newest.created_at = base + chrono::Duration::seconds(60);
+        let expected_ids = vec![oldest.terminal_id, middle.terminal_id, newest.terminal_id];
+
+        // Save out of creation order to prove the sort is not insertion order.
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(newest, cx);
+                store.save(oldest, cx);
+                store.save(middle, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert_eq!(
+                store
+                    .entries_for_path(&folder_paths, None)
+                    .map(|entry| entry.terminal_id)
+                    .collect::<Vec<_>>(),
+                expected_ids
+            );
+            assert_eq!(
+                store
+                    .entries()
+                    .map(|entry| entry.terminal_id)
+                    .collect::<Vec<_>>(),
+                expected_ids
+            );
+        });
+
+        // The order also holds after reloading from the database.
+        reload_store(cx).await;
+        cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            assert_eq!(
+                store
+                    .read(cx)
+                    .entries_for_path(&folder_paths, None)
+                    .map(|entry| entry.terminal_id)
+                    .collect::<Vec<_>>(),
+                expected_ids
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_delete_removes_row_from_database(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let folder_paths = PathList::new(&[Path::new("/repo")]);
+        let first = metadata("first", WorktreePaths::from_folder_paths(&folder_paths));
+        let second = metadata("second", WorktreePaths::from_folder_paths(&folder_paths));
+        let first_id = first.terminal_id;
+        let second_id = second.terminal_id;
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.save(first, cx);
+                store.save(second, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            TerminalThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.delete(first_id, cx);
+            });
+        });
+        cx.run_until_parked();
+        reload_store(cx).await;
+
+        cx.update(|cx| {
+            let store = TerminalThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert!(
+                store.entry(first_id).is_none(),
+                "deleted terminal must not come back after a reload"
+            );
+            assert!(
+                store.entry(second_id).is_some(),
+                "deleting one terminal must not affect the other"
+            );
+        });
     }
 
     #[gpui::test]

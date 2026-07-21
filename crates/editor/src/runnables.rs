@@ -537,6 +537,7 @@ impl Editor {
             let quick_launch = match e {
                 ClickEvent::Keyboard(_) => true,
                 ClickEvent::Mouse(e) => e.down.button == MouseButton::Left,
+                ClickEvent::Touch(_) => true,
             };
 
             window.focus(&editor.focus_handle(cx), cx);
@@ -727,11 +728,20 @@ mod tests {
     use util::rel_path::rel_path;
 
     use crate::{
-        Editor, UPDATE_DEBOUNCE, editor_tests::init_test, scroll::scroll_amount::ScrollAmount,
+        Editor, UPDATE_DEBOUNCE,
+        editor_tests::{init_test, update_test_editor_settings},
+        scroll::scroll_amount::ScrollAmount,
         test::build_editor_with_project,
     };
 
     const FAKE_LSP_NAME: &str = "the-fake-language-server";
+
+    fn init_runnables_test(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        update_test_editor_settings(cx, &|settings| {
+            settings.gutter.get_or_insert_default().runnables = Some(true);
+        });
+    }
 
     struct TestRustContextProvider;
 
@@ -823,7 +833,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_multi_buffer_runnables_on_scroll(cx: &mut TestAppContext) {
-        init_test(cx, |_| {});
+        init_runnables_test(cx);
 
         let padding_lines = 50;
         let mut first_rs = String::from("fn main() {\n    println!(\"hello\");\n}\n");
@@ -966,7 +976,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_lsp_runnables_removed_after_edit(cx: &mut TestAppContext) {
-        init_test(cx, |_| {});
+        init_runnables_test(cx);
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -1088,7 +1098,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_no_runnables_for_unsaved_buffer(cx: &mut TestAppContext) {
-        init_test(cx, |_| {});
+        init_runnables_test(cx);
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(path!("/project"), json!({})).await;
@@ -1181,7 +1191,7 @@ mod tests {
     // a task template that uses the shell program and args.
     #[gpui::test]
     async fn test_shell_runnable_produces_correct_task_template(cx: &mut TestAppContext) {
-        init_test(cx, |_| {});
+        init_runnables_test(cx);
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(

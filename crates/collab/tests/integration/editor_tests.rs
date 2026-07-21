@@ -4214,6 +4214,7 @@ async fn test_git_blame_is_forwarded(cx_a: &mut TestAppContext, cx_b: &mut TestA
         .into_iter()
         .map(|(sha, message)| (sha.parse().unwrap(), message.into()))
         .collect(),
+        tag_names: Default::default(),
     };
     client_a.fs().set_blame_for_repo(
         Path::new(path!("/my-repo/.git")),
@@ -6315,6 +6316,11 @@ async fn test_document_symbols(cx_a: &mut TestAppContext, cx_b: &mut TestAppCont
             store.update_user_settings(cx, |settings| {
                 settings.project.all_languages.defaults.document_symbols =
                     Some(DocumentSymbols::On);
+                settings
+                    .editor
+                    .toolbar
+                    .get_or_insert_default()
+                    .show_breadcrumb_symbols = Some(true);
             });
         });
     });
@@ -6338,6 +6344,11 @@ async fn test_document_symbols(cx_a: &mut TestAppContext, cx_b: &mut TestAppCont
             store.update_user_settings(cx, |settings| {
                 settings.project.all_languages.defaults.document_symbols =
                     Some(DocumentSymbols::On);
+                settings
+                    .editor
+                    .toolbar
+                    .get_or_insert_default()
+                    .show_breadcrumb_symbols = Some(true);
             });
         });
     });

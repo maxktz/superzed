@@ -335,7 +335,7 @@ impl Editor {
                 }
                 (true, false) => self.go_to_type_definition(&GoToTypeDefinition, window, cx),
                 (false, true) => self.go_to_definition_split(&GoToDefinitionSplit, window, cx),
-                (false, false) => self.go_to_definition(&GoToDefinition, window, cx),
+                (false, false) => self.go_to_definition(&GoToDefinition::default(), window, cx),
             }
         } else {
             Task::ready(Ok(Navigated::No))
@@ -2342,6 +2342,8 @@ Sentence ending file2.rs.
                     .to_vec(),
             )
             .await;
+        // Let the worktree pick up the new file before hovering a link to it.
+        cx.run_until_parked();
 
         // file2.rs:5:3 should be highlighted and clickable
         cx.set_state(indoc! {"
@@ -2418,6 +2420,8 @@ Sentence ending file2.rs.
                     .to_vec(),
             )
             .await;
+        // Let the worktree pick up the new file before hovering a link to it.
+        cx.run_until_parked();
 
         // file2.rs:3 should be highlighted and clickable
         cx.set_state(indoc! {"
@@ -2475,6 +2479,8 @@ Sentence ending file2.rs.
                 "line 1\nline 2\nline 3\n".as_bytes().to_vec(),
             )
             .await;
+        // Let the worktree pick up the new file before hovering a link to it.
+        cx.run_until_parked();
 
         // file2.rs:2:in should resolve to file2.rs line 2 (like Ruby backtraces)
         cx.set_state(indoc! {"
@@ -2533,6 +2539,8 @@ Sentence ending file2.rs.
                     .to_vec(),
             )
             .await;
+        // Let the worktree pick up the new file before hovering a link to it.
+        cx.run_until_parked();
 
         // Markdown link [text](file2.rs:3:2) should highlight only the inner link,
         // not the surrounding markdown syntax.

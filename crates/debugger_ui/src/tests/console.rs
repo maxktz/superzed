@@ -4,8 +4,8 @@ use crate::{
     *,
 };
 use dap::requests::StackTrace;
-use editor::{DisplayPoint, display_map::DisplayRow};
 use gpui::{BackgroundExecutor, TestAppContext, VisualTestContext};
+use language::Point;
 use project::{FakeFs, Project};
 use serde_json::json;
 use tests::{init_test, init_test_workspace};
@@ -326,32 +326,44 @@ async fn test_escape_code_processing(executor: BackgroundExecutor, cx: &mut Test
                     .as_str()
             );
 
+            // The console editor is rendered inside a narrow pane, so display
+            // coordinates depend on soft-wrapping. Convert the highlight ranges to
+            // buffer coordinates to make the assertions layout-independent.
             let text_highlights = editor.update(cx, |editor, cx| {
-                let mut text_highlights = editor.all_text_highlights(window, cx).into_iter().flat_map(|(_, ranges)| ranges).collect::<Vec<_>>();
+                let highlights = editor.all_text_highlights(window, cx);
+                let snapshot = editor.snapshot(window, cx);
+                let mut text_highlights = highlights
+                    .into_iter()
+                    .flat_map(|(_, ranges)| ranges)
+                    .map(|range| range.start.to_point(&snapshot)..range.end.to_point(&snapshot))
+                    .collect::<Vec<_>>();
                 text_highlights.sort_by_key(|hl| hl.start);
                 text_highlights
             });
             pretty_assertions::assert_eq!(
                 text_highlights,
                 [
-                    DisplayPoint::new(DisplayRow(1), 3)..DisplayPoint::new(DisplayRow(1), 21),
-                    DisplayPoint::new(DisplayRow(1), 21)..DisplayPoint::new(DisplayRow(2), 0),
-                    DisplayPoint::new(DisplayRow(5), 1)..DisplayPoint::new(DisplayRow(5), 4),
-                    DisplayPoint::new(DisplayRow(5), 4)..DisplayPoint::new(DisplayRow(6), 0),
-                    DisplayPoint::new(DisplayRow(7), 1)..DisplayPoint::new(DisplayRow(7), 4),
-                    DisplayPoint::new(DisplayRow(7), 4)..DisplayPoint::new(DisplayRow(8), 0),
-                    DisplayPoint::new(DisplayRow(8), 0)..DisplayPoint::new(DisplayRow(9), 0),
+                    Point::new(1, 3)..Point::new(1, 21),
+                    Point::new(1, 21)..Point::new(2, 0),
+                    Point::new(5, 1)..Point::new(5, 4),
+                    Point::new(5, 4)..Point::new(6, 0),
+                    Point::new(7, 1)..Point::new(7, 4),
+                    Point::new(7, 4)..Point::new(8, 0),
+                    Point::new(8, 0)..Point::new(9, 0),
                 ]
             );
 
             let background_highlights = editor.update(cx, |editor, cx| {
-                editor.all_text_background_highlights(window, cx).into_iter().map(|(range, _)| range).collect::<Vec<_>>()
+                let highlights = editor.all_text_background_highlights(window, cx);
+                let snapshot = editor.snapshot(window, cx);
+                highlights
+                    .into_iter()
+                    .map(|(range, _)| range.start.to_point(&snapshot)..range.end.to_point(&snapshot))
+                    .collect::<Vec<_>>()
             });
             pretty_assertions::assert_eq!(
                 background_highlights,
-                [
-                    DisplayPoint::new(DisplayRow(8), 0)..DisplayPoint::new(DisplayRow(9), 0),
-                ]
+                [Point::new(8, 0)..Point::new(9, 0)]
             )
         })
         .unwrap();

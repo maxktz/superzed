@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use acp_thread::{AcpThread, ThreadStatus};
+use acp_thread::AcpThread;
 use agent::{NativeAgentServer, ThreadStore};
 use agent_client_protocol::schema::v1 as acp;
 use agent_servers::AgentServer;
@@ -214,23 +214,12 @@ impl AgentThreadItem {
         if conversation_view.is_draft(cx) {
             return None;
         }
-        let has_pending_tool_call = conversation_view.root_thread_has_pending_tool_call(cx);
+        let status = conversation_view.root_thread_display_status(cx)?;
         let thread_id = conversation_view.parent_id();
         let thread_view = conversation_view.root_thread_view()?;
         let thread_view = thread_view.read(cx);
         let thread = thread_view.thread.read(cx);
         let title = conversation_view.title(cx);
-
-        let status = if has_pending_tool_call {
-            AgentThreadStatus::WaitingForConfirmation
-        } else if thread.had_error() {
-            AgentThreadStatus::Error
-        } else {
-            match thread.status() {
-                ThreadStatus::Generating => AgentThreadStatus::Running,
-                ThreadStatus::Idle => AgentThreadStatus::Completed,
-            }
-        };
 
         Some(AgentThreadInfo {
             thread_id,
@@ -886,6 +875,365 @@ impl Domain for AgentThreadItemDb {
 }
 
 db::static_connection!(AgentThreadItemDb, [workspace::WorkspaceDb]);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conversation_view::tests::init_test;
+    use crate::test_support::StubAgentServer;
+    use acp_thread::StubAgentConnection;
+    use agent_settings::AgentSettings;
+    use fs::FakeFs;
+    use gpui::{TestAppContext, VisualTestContext};
+    use serde_json::json;
+    use settings::{NotifyWhenAgentWaiting, Settings as _};
+    use std::cell::RefCell;
+    use std::path::Path;
+    use workspace::MultiWorkspace;
+
+    async fn setup_workspace(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, Entity<Project>, VisualTestContext) {
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            ThreadMetadataStore::init_global(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .expect("test window should expose a workspace");
+        let cx = VisualTestContext::from_window(multi_workspace.into(), cx);
+        (workspace, project, cx)
+    }
+
+    fn disable_agent_notifications(cx: &mut VisualTestContext) {
+        cx.update(|_window, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    notify_when_agent_waiting: NotifyWhenAgentWaiting::Never,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+    }
+
+    fn open_thread_item(
+        workspace: &Entity<Workspace>,
+        agent_id: &str,
+        connection: StubAgentConnection,
+        cx: &mut VisualTestContext,
+    ) -> Entity<AgentThreadItem> {
+        let item = workspace.update_in(cx, |workspace, window, cx| {
+            let server = StubAgentServer::new(connection.with_agent_id(AgentId::new(agent_id)))
+                .with_connection_agent_id();
+            let item = build_agent_thread_item_for_options(
+                workspace,
+                Agent::Custom {
+                    id: AgentId::new(agent_id),
+                },
+                Some(Rc::new(server)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                AgentThreadSource::Sidebar,
+                window,
+                cx,
+            );
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+            item
+        });
+        cx.run_until_parked();
+        item
+    }
+
+    fn send_message_in_item(
+        item: &Entity<AgentThreadItem>,
+        text: &str,
+        cx: &mut VisualTestContext,
+    ) {
+        let thread_view = item.read_with(cx, |item, cx| {
+            item.conversation_view()
+                .read(cx)
+                .root_thread_view()
+                .expect("item should have a root thread view")
+        });
+        let message_editor = thread_view.read_with(cx, |view, _cx| view.message_editor.clone());
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text(text, window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+    }
+
+    fn set_thread_title(item: &Entity<AgentThreadItem>, title: &str, cx: &mut VisualTestContext) {
+        let thread_id = item.read_with(cx, |item, cx| item.thread_id(cx));
+        cx.update(|_window, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.set_title_override(thread_id, SharedString::from(title.to_string()), cx);
+            });
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_agent_thread_tab_lifecycle(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (workspace, _project, mut cx) = setup_workspace(cx).await;
+        let cx = &mut cx;
+        disable_agent_notifications(cx);
+
+        let connection_a = StubAgentConnection::new();
+        connection_a.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Response A".into()),
+        )]);
+        let item_a = open_thread_item(&workspace, "agent-a", connection_a, cx);
+        send_message_in_item(&item_a, "Hello A", cx);
+        set_thread_title(&item_a, "Thread A", cx);
+
+        let connection_b = StubAgentConnection::new();
+        connection_b.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Response B".into()),
+        )]);
+        let item_b = open_thread_item(&workspace, "agent-b", connection_b, cx);
+        send_message_in_item(&item_b, "Hello B", cx);
+        set_thread_title(&item_b, "Thread B", cx);
+
+        let pane = workspace.read_with(cx, |workspace, _cx| workspace.active_pane().clone());
+        pane.read_with(cx, |pane, _cx| {
+            assert_eq!(
+                pane.items_len(),
+                2,
+                "both agent threads should be open as tabs in the pane"
+            );
+        });
+
+        cx.update(|window, cx| {
+            assert_eq!(item_a.read(cx).tab_content_text(0, cx), "Thread A");
+            assert_eq!(item_b.read(cx).tab_content_text(0, cx), "Thread B");
+            assert!(
+                item_a.read(cx).tab_icon(window, cx).is_some(),
+                "thread tabs should have an agent icon"
+            );
+            assert!(item_b.read(cx).tab_icon(window, cx).is_some());
+            assert_eq!(
+                item_a.read(cx).conversation_view().read(cx).agent_key(),
+                &Agent::Custom {
+                    id: AgentId::new("agent-a")
+                }
+            );
+            assert_eq!(
+                item_b.read(cx).conversation_view().read(cx).agent_key(),
+                &Agent::Custom {
+                    id: AgentId::new("agent-b")
+                }
+            );
+        });
+
+        let weak_b = item_b.downgrade();
+        pane.update_in(cx, |pane, window, cx| {
+            pane.close_item_by_id(item_b.entity_id(), SaveIntent::Close, window, cx)
+        })
+        .await
+        .expect("closing an agent thread tab should succeed");
+        drop(item_b);
+        cx.run_until_parked();
+
+        pane.read_with(cx, |pane, _cx| {
+            assert_eq!(
+                pane.items_len(),
+                1,
+                "closing a tab should remove the item from the pane"
+            );
+        });
+        assert!(
+            !weak_b.is_upgradable(),
+            "closing a tab should drop the item entity"
+        );
+        cx.update(|_window, cx| {
+            assert_eq!(item_a.read(cx).tab_content_text(0, cx), "Thread A");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_thread_item_serialize_round_trip(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (workspace, project, mut cx) = setup_workspace(cx).await;
+        let cx = &mut cx;
+        disable_agent_notifications(cx);
+        workspace.update(cx, |workspace, _cx| {
+            workspace.set_random_database_id();
+        });
+
+        let connection = StubAgentConnection::new();
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("Response".into()),
+        )]);
+        let item = open_thread_item(&workspace, "stub", connection, cx);
+        send_message_in_item(&item, "Hello", cx);
+
+        // Adding the item schedules a throttled workspace serialization; drain
+        // it so the workspaces row exists before the item row references it.
+        cx.executor()
+            .advance_clock(workspace::SERIALIZATION_THROTTLE_TIME * 2);
+        cx.run_until_parked();
+
+        let thread_id = item.read_with(cx, |item, cx| item.thread_id(cx));
+        let workspace_id = workspace
+            .read_with(cx, |workspace, _cx| workspace.database_id())
+            .expect("workspace should have a database id");
+        let item_id = item.entity_id().as_u64() as ItemId;
+
+        let serialize_task = workspace.update_in(cx, |workspace, window, cx| {
+            item.update(cx, |item, cx| {
+                item.serialize(workspace, item_id, false, window, cx)
+            })
+            .expect("agent thread items should serialize")
+        });
+        serialize_task
+            .await
+            .expect("serializing the item should succeed");
+        cx.run_until_parked();
+
+        let restored = cx
+            .update(|window, cx| {
+                AgentThreadItem::deserialize(
+                    project.clone(),
+                    workspace.downgrade(),
+                    workspace_id,
+                    item_id,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("deserializing the item should restore the thread tab");
+        cx.run_until_parked();
+
+        let restored_thread_id = restored.read_with(cx, |item, cx| item.thread_id(cx));
+        assert_eq!(
+            restored_thread_id, thread_id,
+            "the restored tab should point at the same thread"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_tab_updates_on_run_state_transitions(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (workspace, _project, mut cx) = setup_workspace(cx).await;
+        let cx = &mut cx;
+        disable_agent_notifications(cx);
+
+        let connection = StubAgentConnection::new();
+        let item = open_thread_item(&workspace, "agent-a", connection.clone(), cx);
+
+        let update_tab_count = Rc::new(RefCell::new(0_usize));
+        let _subscription = cx.update(|_window, cx| {
+            cx.subscribe(&item, {
+                let update_tab_count = update_tab_count.clone();
+                move |_item, event: &ItemEvent, _cx| {
+                    if matches!(event, ItemEvent::UpdateTab) {
+                        *update_tab_count.borrow_mut() += 1;
+                    }
+                }
+            })
+        });
+        let take_count = |count: &Rc<RefCell<usize>>| std::mem::take(&mut *count.borrow_mut());
+
+        send_message_in_item(&item, "Hello", cx);
+        assert!(
+            take_count(&update_tab_count) > 0,
+            "starting a turn should update the tab"
+        );
+        item.read_with(cx, |item, cx| {
+            assert_eq!(
+                item.conversation_view().read(cx).root_thread_run_state(cx),
+                crate::ThreadRunState::Running
+            );
+        });
+
+        let thread = item.read_with(cx, |item, cx| {
+            item.root_thread(cx).expect("root thread should exist")
+        });
+        let session_id = thread.read_with(cx, |thread, _cx| thread.session_id().clone());
+        let (elicitation_id, _response_task) = thread.update(cx, |thread, cx| {
+            thread
+                .request_elicitation_with_id(
+                    acp::CreateElicitationRequest::new(
+                        acp::ElicitationFormMode::new(
+                            acp::ElicitationSessionScope::new(session_id.clone()),
+                            acp::ElicitationSchema::new().string("name", true),
+                        ),
+                        "Provide a name",
+                    ),
+                    cx,
+                )
+                .expect("elicitation request should be accepted")
+        });
+        cx.run_until_parked();
+
+        assert!(
+            take_count(&update_tab_count) > 0,
+            "an elicitation request should update the tab"
+        );
+        item.read_with(cx, |item, cx| {
+            assert_eq!(
+                item.conversation_view().read(cx).root_thread_run_state(cx),
+                crate::ThreadRunState::ParkedOnHuman(crate::ParkedReason::Elicitation)
+            );
+            assert_eq!(
+                item.active_thread_info(cx)
+                    .expect("active thread info should exist")
+                    .status,
+                AgentThreadStatus::WaitingForConfirmation
+            );
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread.respond_to_elicitation(
+                &elicitation_id,
+                acp::CreateElicitationResponse::new(acp::ElicitationAction::Accept(
+                    acp::ElicitationAcceptAction::new(),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(
+            take_count(&update_tab_count) > 0,
+            "an elicitation response should update the tab"
+        );
+
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+        assert!(
+            take_count(&update_tab_count) > 0,
+            "finishing the turn should update the tab"
+        );
+        item.read_with(cx, |item, cx| {
+            assert_eq!(
+                item.conversation_view().read(cx).root_thread_run_state(cx),
+                crate::ThreadRunState::Idle
+            );
+            assert_eq!(
+                item.active_thread_info(cx)
+                    .expect("active thread info should exist")
+                    .status,
+                AgentThreadStatus::Completed
+            );
+        });
+    }
+}
 
 impl AgentThreadItemDb {
     async fn save_thread_id(
