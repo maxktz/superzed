@@ -116,6 +116,11 @@ const TERMINAL_INIT_COMMAND_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 // behind. Re-check shortly after output settles so the final cwd is persisted
 // even when the shell produces no further output.
 const TERMINAL_METADATA_RECHECK_DEBOUNCE: Duration = Duration::from_millis(500);
+// Status scraping runs shortly after output settles rather than on every
+// wakeup; a finished agent goes quiet, so pending Working -> Idle holds are
+// confirmed by rescheduled scrapes instead of further output.
+const TERMINAL_STATUS_SCRAPE_DEBOUNCE: Duration = Duration::from_millis(150);
+const TERMINAL_STATUS_SCRAPE_LINES: usize = 40;
 const KNOWN_TERMINAL_AGENT_COMMANDS: &[&str] = &[
     "agent", // Unfortunately, both Cursor cli + grok
     "agy",
@@ -1023,7 +1028,17 @@ struct AgentTerminal {
     notification_windows: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: Vec<Subscription>,
     metadata_recheck_task: Option<Task<()>>,
+    agent_kind: Option<agent_detect::AgentKind>,
+    status_tracker: agent_detect::StatusTracker,
+    status_scrape_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The detected state of an agent CLI running inside a terminal thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalAgentStatus {
+    pub agent: agent_detect::AgentKind,
+    pub state: agent_detect::AgentState,
 }
 
 impl AgentTerminal {
@@ -2282,6 +2297,7 @@ impl AgentPanel {
                     this.refresh_terminal_metadata(terminal_id, cx);
                     this.report_terminal_program(terminal_id, source, cx);
                     this.schedule_terminal_metadata_recheck(terminal_id, cx);
+                    this.schedule_terminal_status_scrape(terminal_id, window, cx);
                 }
                 TerminalEvent::Bell => this.mark_terminal_notification(terminal_id, window, cx),
                 TerminalEvent::CloseTerminal => {
@@ -2312,6 +2328,9 @@ impl AgentPanel {
             notification_windows: Vec::new(),
             notification_subscriptions: Vec::new(),
             metadata_recheck_task: None,
+            agent_kind: None,
+            status_tracker: agent_detect::StatusTracker::default(),
+            status_scrape_task: None,
             _subscriptions: vec![view_subscription, terminal_subscription],
         };
         if self.pending_terminal_spawn == Some(terminal_id) {
@@ -2472,6 +2491,107 @@ impl AgentPanel {
     ) {
         if let Some(terminal) = self.terminals.get_mut(&terminal_id) {
             terminal.report_started_terminal_program(terminal_id, source, cx);
+        }
+    }
+
+    pub fn terminal_agent_status(&self, terminal_id: TerminalId) -> Option<TerminalAgentStatus> {
+        let terminal = self.terminals.get(&terminal_id)?;
+        let agent = terminal.agent_kind?;
+        let state = terminal.status_tracker.published_state()?;
+        Some(TerminalAgentStatus { agent, state })
+    }
+
+    fn schedule_terminal_status_scrape(
+        &mut self,
+        terminal_id: TerminalId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        if terminal.status_scrape_task.is_some() {
+            return;
+        }
+        terminal.status_scrape_task = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(TERMINAL_STATUS_SCRAPE_DEBOUNCE)
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                if let Some(terminal) = this.terminals.get_mut(&terminal_id) {
+                    terminal.status_scrape_task = None;
+                }
+                this.scrape_terminal_status(terminal_id, window, cx);
+            })
+            .ok();
+        }));
+    }
+
+    fn scrape_terminal_status(
+        &mut self,
+        terminal_id: TerminalId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(terminal) = self.terminals.get(&terminal_id) else {
+            return;
+        };
+        let terminal_state = terminal.view.read(cx).terminal().read(cx);
+        let agent = terminal_state
+            .foreground_process_command_name()
+            .as_deref()
+            .and_then(agent_detect::AgentKind::from_command_name);
+        let detection = agent.map(|agent| {
+            let screen = terminal_state
+                .last_n_non_empty_lines(TERMINAL_STATUS_SCRAPE_LINES)
+                .join("\n");
+            let osc_title = terminal_state.breadcrumb_text.clone();
+            agent_detect::detect(
+                agent,
+                agent_detect::DetectionInput {
+                    screen: &screen,
+                    osc_title: &osc_title,
+                },
+            )
+        });
+
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        let agent_changed = terminal.agent_kind != agent;
+        if agent_changed {
+            terminal.agent_kind = agent;
+            terminal.status_tracker.reset();
+        }
+
+        let mut transition = None;
+        if let Some(detection) = detection {
+            let previous = terminal.status_tracker.published_state();
+            if let Some(published) = terminal
+                .status_tracker
+                .update(detection, std::time::Instant::now())
+            {
+                transition = Some((previous, published));
+            }
+        }
+        let reschedule = terminal.status_tracker.is_holding_idle();
+
+        if let Some((previous, published)) = transition {
+            let needs_attention = published == agent_detect::AgentState::Blocked
+                || (published == agent_detect::AgentState::Idle
+                    && previous == Some(agent_detect::AgentState::Working));
+            if needs_attention {
+                self.mark_terminal_notification(terminal_id, window, cx);
+            }
+            cx.emit(AgentPanelEvent::EntryChanged);
+            cx.notify();
+        } else if agent_changed {
+            cx.emit(AgentPanelEvent::EntryChanged);
+            cx.notify();
+        }
+
+        if reschedule {
+            self.schedule_terminal_status_scrape(terminal_id, window, cx);
         }
     }
 

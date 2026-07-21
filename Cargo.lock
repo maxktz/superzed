@@ -468,6 +468,7 @@ dependencies = [
  "action_log",
  "agent",
  "agent-client-protocol",
+ "agent_detect",
  "agent_servers",
  "agent_settings",
  "agent_skills",
