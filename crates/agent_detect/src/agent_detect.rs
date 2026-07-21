@@ -63,6 +63,17 @@ impl AgentKind {
             Self::Codex => vec!["codex".into(), "resume".into(), session_ref.into()],
         }
     }
+
+    /// Command-line to use when the agent should be relaunched but no session
+    /// was captured. Claude Code can resume the most recent conversation for
+    /// the working directory; codex has no per-directory equivalent, so it
+    /// starts fresh.
+    pub fn relaunch_argv(&self) -> Vec<String> {
+        match self {
+            Self::ClaudeCode => vec!["claude".into(), "--continue".into()],
+            Self::Codex => vec!["codex".into()],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -201,6 +212,249 @@ impl StatusTracker {
     /// The agent process is gone; the terminal is a plain shell again.
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+}
+
+pub mod session_discovery {
+    //! Locates the on-disk session an agent CLI is writing, so the terminal
+    //! thread can be resumed after a restart. Purely correlational (newest
+    //! session file for the working directory, modified since the agent
+    //! started) — no agent configuration is touched.
+
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
+
+    use super::AgentKind;
+
+    /// Claude Code stores transcripts under
+    /// `~/.claude/projects/<munged-cwd>/<session-id>.jsonl`, where the munged
+    /// directory name replaces every non-alphanumeric character with `-`.
+    pub fn claude_project_dir_name(cwd: &Path) -> String {
+        cwd.to_string_lossy()
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    }
+
+    pub fn find_session(
+        agent: AgentKind,
+        home_dir: &Path,
+        cwd: &Path,
+        since: SystemTime,
+    ) -> Option<String> {
+        match agent {
+            AgentKind::ClaudeCode => find_claude_session(home_dir, cwd, since),
+            AgentKind::Codex => find_codex_session(home_dir, cwd, since),
+        }
+    }
+
+    fn find_claude_session(home_dir: &Path, cwd: &Path, since: SystemTime) -> Option<String> {
+        let project_dir = home_dir
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_dir_name(cwd));
+        let mut newest: Option<(SystemTime, String)> = None;
+        for entry in fs::read_dir(project_dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "jsonl") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+                continue;
+            };
+            if modified < since {
+                continue;
+            }
+            if newest
+                .as_ref()
+                .is_none_or(|(newest_time, _)| modified > *newest_time)
+            {
+                newest = Some((modified, stem.to_string()));
+            }
+        }
+        newest.map(|(_, session_id)| session_id)
+    }
+
+    /// Codex stores rollouts under
+    /// `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<session-id>.jsonl`;
+    /// the first line records the session's working directory.
+    fn find_codex_session(home_dir: &Path, cwd: &Path, since: SystemTime) -> Option<String> {
+        let sessions_dir = home_dir.join(".codex").join("sessions");
+        let mut candidates: Vec<(SystemTime, PathBuf)> = Vec::new();
+        collect_recent_files(&sessions_dir, since, 3, &mut candidates);
+        candidates.sort_by(|(left, _), (right, _)| right.cmp(left));
+
+        let cwd_string = cwd.to_string_lossy();
+        for (_, path) in candidates.into_iter().take(20) {
+            let Ok(contents) = fs::File::open(&path).map(std::io::BufReader::new) else {
+                continue;
+            };
+            use std::io::BufRead as _;
+            let Some(Ok(first_line)) = contents.lines().next() else {
+                continue;
+            };
+            // The first line is session metadata JSON; a plain substring
+            // check for the quoted cwd avoids depending on its exact shape.
+            if !first_line.contains(cwd_string.as_ref()) {
+                continue;
+            }
+            if let Some(session_id) = codex_session_id_from_filename(&path) {
+                return Some(session_id);
+            }
+        }
+        None
+    }
+
+    fn collect_recent_files(
+        dir: &Path,
+        since: SystemTime,
+        depth: usize,
+        candidates: &mut Vec<(SystemTime, PathBuf)>,
+    ) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if depth > 0 {
+                    collect_recent_files(&path, since, depth - 1, candidates);
+                }
+                continue;
+            }
+            if path.extension().is_none_or(|extension| extension != "jsonl") {
+                continue;
+            }
+            let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+                continue;
+            };
+            if modified >= since {
+                candidates.push((modified, path));
+            }
+        }
+    }
+
+    fn codex_session_id_from_filename(path: &Path) -> Option<String> {
+        let stem = path.file_stem()?.to_str()?;
+        // rollout-2026-07-21T22-15-03-<uuid>: the uuid is the last 36 chars.
+        if stem.len() < 36 {
+            return None;
+        }
+        let candidate = &stem[stem.len() - 36..];
+        let is_uuid = candidate.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        });
+        is_uuid.then(|| candidate.to_string())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::io::Write as _;
+        use std::time::Duration;
+
+        struct TempDir(PathBuf);
+
+        impl TempDir {
+            fn new(name: &str) -> Self {
+                let path = std::env::temp_dir().join(format!(
+                    "agent_detect_test_{}_{}",
+                    name,
+                    std::process::id()
+                ));
+                let _ = fs::remove_dir_all(&path);
+                fs::create_dir_all(&path).expect("create temp dir");
+                Self(path)
+            }
+        }
+
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        #[test]
+        fn munges_cwd_like_claude_code() {
+            assert_eq!(
+                claude_project_dir_name(Path::new("/Users/foo/code/pay.kit_v2")),
+                "-Users-foo-code-pay-kit-v2"
+            );
+        }
+
+        #[test]
+        fn finds_newest_claude_transcript_modified_since_launch() {
+            let home = TempDir::new("claude");
+            let cwd = Path::new("/repo/app");
+            let project_dir = home
+                .0
+                .join(".claude")
+                .join("projects")
+                .join(claude_project_dir_name(cwd));
+            fs::create_dir_all(&project_dir).expect("create project dir");
+
+            let stale = project_dir.join("00000000-0000-0000-0000-000000000000.jsonl");
+            fs::write(&stale, "{}").expect("write stale transcript");
+            let since = SystemTime::now() + Duration::from_secs(1);
+
+            assert_eq!(
+                find_session(AgentKind::ClaudeCode, &home.0, cwd, since),
+                None,
+                "a transcript older than the launch must not be picked up"
+            );
+
+            let live = project_dir.join("11111111-2222-3333-4444-555555555555.jsonl");
+            fs::write(&live, "{}").expect("write live transcript");
+            let since = SystemTime::now() - Duration::from_secs(60);
+            assert_eq!(
+                find_session(AgentKind::ClaudeCode, &home.0, cwd, since).as_deref(),
+                Some("11111111-2222-3333-4444-555555555555")
+            );
+        }
+
+        #[test]
+        fn finds_codex_rollout_matching_cwd() {
+            let home = TempDir::new("codex");
+            let cwd = Path::new("/repo/app");
+            let day_dir = home
+                .0
+                .join(".codex")
+                .join("sessions")
+                .join("2026")
+                .join("07")
+                .join("21");
+            fs::create_dir_all(&day_dir).expect("create sessions dir");
+
+            let other = day_dir
+                .join("rollout-2026-07-21T10-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
+            let mut file = fs::File::create(&other).expect("create other rollout");
+            writeln!(file, r#"{{"type":"session_meta","cwd":"/elsewhere"}}"#).expect("write");
+
+            let matching = day_dir
+                .join("rollout-2026-07-21T11-00-00-12345678-9abc-def0-1234-56789abcdef0.jsonl");
+            let mut file = fs::File::create(&matching).expect("create matching rollout");
+            writeln!(file, r#"{{"type":"session_meta","cwd":"/repo/app"}}"#).expect("write");
+
+            let since = SystemTime::now() - Duration::from_secs(60);
+            assert_eq!(
+                find_session(AgentKind::Codex, &home.0, cwd, since).as_deref(),
+                Some("12345678-9abc-def0-1234-56789abcdef0")
+            );
+        }
     }
 }
 

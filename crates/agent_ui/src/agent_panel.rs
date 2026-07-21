@@ -121,6 +121,9 @@ const TERMINAL_METADATA_RECHECK_DEBOUNCE: Duration = Duration::from_millis(500);
 // confirmed by rescheduled scrapes instead of further output.
 const TERMINAL_STATUS_SCRAPE_DEBOUNCE: Duration = Duration::from_millis(150);
 const TERMINAL_STATUS_SCRAPE_LINES: usize = 40;
+// The agent process starts before detection first notices it, so session
+// files created in that window must still be attributed to this terminal.
+const TERMINAL_SESSION_CAPTURE_SLACK: Duration = Duration::from_secs(15);
 const KNOWN_TERMINAL_AGENT_COMMANDS: &[&str] = &[
     "agent", // Unfortunately, both Cursor cli + grok
     "agy",
@@ -1030,8 +1033,14 @@ struct AgentTerminal {
     notification_subscriptions: Vec<Subscription>,
     metadata_recheck_task: Option<Task<()>>,
     agent_kind: Option<agent_detect::AgentKind>,
+    /// The agent this restored terminal relaunched, used for persistence
+    /// until live detection re-identifies (or rules out) the process.
+    restored_agent: Option<agent_detect::AgentKind>,
+    agent_detected_at: Option<std::time::SystemTime>,
+    agent_session: Option<String>,
     status_tracker: agent_detect::StatusTracker,
     status_scrape_task: Option<Task<()>>,
+    session_capture_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1209,6 +1218,10 @@ pub struct AgentPanel {
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
     terminals: HashMap<TerminalId, AgentTerminal>,
     pending_terminal_spawn: Option<TerminalId>,
+    /// Agent and captured session for terminals being restored, applied when
+    /// the spawned terminal registers so they survive a quit before live
+    /// detection re-identifies the agent.
+    pending_restored_agents: HashMap<TerminalId, (agent_detect::AgentKind, Option<String>)>,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
     agent_panel_menu_handle: PopoverMenuHandle<ContextMenu>,
     _extension_subscription: Option<Subscription>,
@@ -1621,6 +1634,7 @@ impl AgentPanel {
             retained_threads: HashMap::default(),
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
+            pending_restored_agents: HashMap::default(),
             new_thread_menu_handle: PopoverMenuHandle::default(),
             agent_panel_menu_handle: PopoverMenuHandle::default(),
 
@@ -2374,6 +2388,7 @@ impl AgentPanel {
         let last_known_terminal_title = initial_title
             .map(|title| title.to_string())
             .unwrap_or_default();
+        let restored_agent_and_session = self.pending_restored_agents.remove(&terminal_id);
         let mut terminal = AgentTerminal {
             view: terminal_view,
             title_editor: None,
@@ -2390,8 +2405,14 @@ impl AgentPanel {
             notification_subscriptions: Vec::new(),
             metadata_recheck_task: None,
             agent_kind: None,
+            restored_agent: restored_agent_and_session
+                .as_ref()
+                .map(|(agent, _)| *agent),
+            agent_detected_at: None,
+            agent_session: restored_agent_and_session.and_then(|(_, session)| session),
             status_tracker: agent_detect::StatusTracker::default(),
             status_scrape_task: None,
+            session_capture_task: None,
             _subscriptions: vec![view_subscription, terminal_subscription],
         };
         if self.pending_terminal_spawn == Some(terminal_id) {
@@ -2622,7 +2643,13 @@ impl AgentPanel {
         let agent_changed = terminal.agent_kind != agent;
         if agent_changed {
             terminal.agent_kind = agent;
+            // Live detection has spoken; the restored hint is obsolete.
+            terminal.restored_agent = None;
             terminal.status_tracker.reset();
+            terminal.agent_detected_at = agent
+                .is_some()
+                .then(std::time::SystemTime::now)
+                .map(|now| now - TERMINAL_SESSION_CAPTURE_SLACK);
         }
 
         let mut transition = None;
@@ -2644,9 +2671,11 @@ impl AgentPanel {
             if needs_attention {
                 self.mark_terminal_notification(terminal_id, window, cx);
             }
+            self.schedule_agent_session_capture(terminal_id, cx);
             cx.emit(AgentPanelEvent::EntryChanged);
             cx.notify();
         } else if agent_changed {
+            self.persist_terminal_metadata(terminal_id, cx);
             cx.emit(AgentPanelEvent::EntryChanged);
             cx.notify();
         }
@@ -2654,6 +2683,56 @@ impl AgentPanel {
         if reschedule {
             self.schedule_terminal_status_scrape(terminal_id, window, cx);
         }
+    }
+
+    /// Looks up on disk which session the agent CLI is writing, so the
+    /// conversation can be resumed when the terminal thread is restored
+    /// after a restart. Runs after status transitions, when the agent has
+    /// just flushed output.
+    fn schedule_agent_session_capture(&mut self, terminal_id: TerminalId, cx: &mut Context<Self>) {
+        let Some(terminal) = self.terminals.get_mut(&terminal_id) else {
+            return;
+        };
+        if terminal.session_capture_task.is_some() {
+            return;
+        }
+        let Some(agent) = terminal.agent_kind else {
+            return;
+        };
+        let Some(since) = terminal.agent_detected_at else {
+            return;
+        };
+        let Some(cwd) = terminal.working_directory.clone() else {
+            return;
+        };
+        if self.project.read(cx).remote_connection_options(cx).is_some() {
+            // Session files live on the remote host; local discovery would
+            // find another project's sessions.
+            return;
+        }
+        let home_dir = paths::home_dir().clone();
+
+        terminal.session_capture_task = Some(cx.spawn(async move |this, cx| {
+            let session = cx
+                .background_spawn(async move {
+                    agent_detect::session_discovery::find_session(agent, &home_dir, &cwd, since)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                let Some(terminal) = this.terminals.get_mut(&terminal_id) else {
+                    return;
+                };
+                terminal.session_capture_task = None;
+                if let Some(session) = session
+                    && terminal.agent_kind == Some(agent)
+                    && terminal.agent_session.as_deref() != Some(session.as_str())
+                {
+                    terminal.agent_session = Some(session);
+                    this.persist_terminal_metadata(terminal_id, cx);
+                }
+            })
+            .ok();
+        }));
     }
 
     fn persist_all_terminal_metadata(&self, cx: &mut Context<Self>) {
@@ -2690,6 +2769,11 @@ impl AgentPanel {
             worktree_paths: project.worktree_paths(cx),
             remote_connection: project.remote_connection_options(cx),
             working_directory: terminal.working_directory.clone(),
+            agent: terminal
+                .agent_kind
+                .or(terminal.restored_agent)
+                .map(|agent| agent.label().to_string()),
+            agent_session: terminal.agent_session.clone(),
         })
     }
 
@@ -2714,6 +2798,15 @@ impl AgentPanel {
         self.pending_terminal_spawn = Some(metadata.terminal_id);
         let working_directory = self.terminal_restore_working_directory(&metadata, workspace, cx);
         let initial_title = Self::terminal_restore_initial_title(&metadata);
+        let launch_argv = Self::terminal_restore_launch_argv(&metadata);
+        if let Some(agent) = metadata
+            .agent
+            .as_deref()
+            .and_then(agent_detect::AgentKind::from_command_name)
+        {
+            self.pending_restored_agents
+                .insert(metadata.terminal_id, (agent, metadata.agent_session.clone()));
+        }
         self.spawn_terminal(
             metadata.terminal_id,
             working_directory,
@@ -2723,11 +2816,23 @@ impl AgentPanel {
             true,
             focus,
             true,
-            None,
+            launch_argv,
             source,
             window,
             cx,
         );
+    }
+
+    /// The command to relaunch a restored terminal thread's agent with its
+    /// prior conversation: `claude --resume <session>` / `codex resume
+    /// <session>` when a session was captured, otherwise the agent's
+    /// relaunch fallback.
+    fn terminal_restore_launch_argv(metadata: &TerminalThreadMetadata) -> Option<Vec<String>> {
+        let agent = agent_detect::AgentKind::from_command_name(metadata.agent.as_deref()?)?;
+        Some(match metadata.agent_session.as_deref() {
+            Some(session) => agent.resume_argv(session),
+            None => agent.relaunch_argv(),
+        })
     }
 
     fn restore_terminal_for_panel_load(
@@ -7654,6 +7759,8 @@ mod tests {
             worktree_paths: project.read_with(cx, |project, cx| project.worktree_paths(cx)),
             remote_connection: None,
             working_directory: None,
+            agent: None,
+            agent_session: None,
         };
         assert_eq!(metadata.working_directory, None);
 
@@ -7741,6 +7848,8 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            agent: None,
+            agent_session: None,
         };
         let terminal_id = metadata.terminal_id;
         panel
@@ -7916,6 +8025,8 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            agent: None,
+            agent_session: None,
         };
         panel
             .update_in(&mut cx, |panel, window, cx| {
@@ -9926,6 +10037,8 @@ mod tests {
             worktree_paths: worktree_paths.clone(),
             remote_connection: None,
             working_directory: None,
+            agent: None,
+            agent_session: None,
         };
         let newer = TerminalThreadMetadata {
             terminal_id: TerminalId::new(),
@@ -9935,6 +10048,8 @@ mod tests {
             worktree_paths,
             remote_connection: None,
             working_directory: None,
+            agent: None,
+            agent_session: None,
         };
         assert_ne!(older.terminal_id, newer.terminal_id);
 
@@ -10149,6 +10264,8 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            agent: None,
+            agent_session: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
@@ -10200,6 +10317,8 @@ mod tests {
             )])),
             remote_connection: None,
             working_directory: None,
+            agent: None,
+            agent_session: None,
         };
 
         panel.update_in(&mut cx, |panel, window, cx| {
