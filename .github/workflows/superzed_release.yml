@@ -46,7 +46,7 @@ jobs:
       tag: ${{ steps.check.outputs.tag }}
       should_release: ${{ steps.check.outputs.should_release }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: check
         name: Decide whether to release
         env:
@@ -98,8 +98,8 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
       - name: Set release channel to stable
@@ -108,12 +108,12 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - name: Bundle macOS app (aarch64)
         run: ./script/bundle-mac aarch64-apple-darwin
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: Superzed-macos-aarch64.dmg
           path: target/aarch64-apple-darwin/release/Zed-aarch64.dmg
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: superzed-remote-server-macos-aarch64.gz
           path: target/zed-remote-server-macos-aarch64.gz
@@ -132,7 +132,7 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
           df -h /
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set release channel to stable
         run: echo stable > crates/zed/RELEASE_CHANNEL
       - name: Install Linux dependencies
@@ -141,12 +141,12 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - name: Bundle Linux tarball (x86_64)
         run: ./script/bundle-linux
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: superzed-linux-x86_64.tar.gz
           path: target/release/zed-linux-x86_64.tar.gz
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: superzed-remote-server-linux-x86_64.gz
           path: target/zed-remote-server-linux-x86_64.gz
@@ -160,7 +160,7 @@ jobs:
     steps:
       - name: Enable git long paths
         run: git config --system core.longpaths true
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set release channel to stable
         run: Set-Content -Path crates/zed/RELEASE_CHANNEL -Value 'stable'
       - name: Install Rust toolchain
@@ -170,12 +170,12 @@ jobs:
           exit 0
       - name: Bundle Windows installer (x86_64)
         run: script/bundle-windows.ps1 -Architecture x86_64
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: SuperzedSetup-windows-x86_64.exe
           path: target/Zed-x86_64.exe
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: superzed-remote-server-windows-x86_64.zip
           path: target/zed-remote-server-windows-x86_64.zip
@@ -190,7 +190,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Prepare release assets
