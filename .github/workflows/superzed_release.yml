@@ -122,11 +122,15 @@ jobs:
   bundle-linux:
     needs: detect
     if: needs.detect.outputs.should_release == 'true'
-    runs-on: ubuntu-latest
+    # 22.04 (glibc 2.35) instead of 24.04: glibc 2.38+ headers emit
+    # __isoc23_* symbols into C objects, which then fail to link into the
+    # static musl remote_server. An older build host also lowers the glibc
+    # floor for users of the tarball.
+    runs-on: ubuntu-22.04
     timeout-minutes: 360
     env:
-      CC: clang
-      CXX: clang++
+      CC: clang-18
+      CXX: clang++-18
     steps:
       - name: Free up disk space
         run: |
@@ -137,6 +141,12 @@ jobs:
         run: echo stable > crates/zed/RELEASE_CHANNEL
       - name: Install Linux dependencies
         run: ./script/linux
+      - name: Install clang 18
+        # webrtc-sys needs clang 17+; Ubuntu 22.04 ships clang 14.
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 18
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - name: Bundle Linux tarball (x86_64)
