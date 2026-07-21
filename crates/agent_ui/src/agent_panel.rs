@@ -2081,6 +2081,38 @@ impl AgentPanel {
             true,
             true,
             true,
+            None,
+            source,
+            window,
+            cx,
+        );
+    }
+
+    /// Creates a terminal thread that immediately launches the given agent
+    /// CLI in the project's working directory.
+    pub fn new_agent_terminal(
+        &mut self,
+        agent: agent_detect::AgentKind,
+        workspace: Option<&Workspace>,
+        source: AgentThreadSource,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.supports_terminal(cx) {
+            return;
+        }
+        self.set_last_created_entry_kind_from_user_action(AgentPanelEntryKind::Terminal, cx);
+        let working_directory = self.terminal_working_directory(workspace, cx);
+        self.spawn_terminal(
+            TerminalId::new(),
+            working_directory,
+            None,
+            None,
+            None,
+            true,
+            true,
+            true,
+            Some(vec![agent.executable().to_string()]),
             source,
             window,
             cx,
@@ -2135,12 +2167,14 @@ impl AgentPanel {
         select: bool,
         focus: bool,
         run_init_command: bool,
+        launch_argv: Option<Vec<String>>,
         source: AgentThreadSource,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let terminal_working_directory = working_directory.clone();
         let init_command = Self::terminal_init_command(run_init_command, cx);
+        let launch_command = launch_argv.as_deref().map(Self::shell_command_for_argv);
         let terminal_task = self.project.update(cx, |project, cx| {
             project.create_terminal_shell(working_directory, cx)
         });
@@ -2187,7 +2221,11 @@ impl AgentPanel {
                     window,
                     cx,
                 );
-                Self::write_terminal_init_command(&terminal_for_init_command, init_command, cx);
+                let startup_commands = init_command
+                    .into_iter()
+                    .chain(launch_command)
+                    .collect::<Vec<_>>();
+                Self::write_terminal_init_command(&terminal_for_init_command, startup_commands, cx);
             })?;
             anyhow::Ok(())
         })
@@ -2201,14 +2239,36 @@ impl AgentPanel {
             .filter(|command| !command.trim().is_empty())
     }
 
+    /// Renders an argv as a single shell command line, quoting each argument
+    /// so session ids and paths reach the program as literal data.
+    fn shell_command_for_argv(argv: &[String]) -> String {
+        argv.iter()
+            .map(|argument| {
+                if !argument.is_empty()
+                    && argument
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"-_./=:@%+,".contains(&byte))
+                {
+                    argument.clone()
+                } else {
+                    format!("'{}'", argument.replace('\'', "'\\''"))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     fn write_terminal_init_command(
         terminal: &Entity<terminal::Terminal>,
-        init_command: Option<String>,
+        commands: Vec<String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(command) = init_command else {
+        if commands.is_empty() {
             return;
-        };
+        }
+        // A single write keeps the commands ordered; the shell executes each
+        // line in sequence.
+        let command = commands.join("\x0d");
 
         if !terminal.read(cx).is_pty() {
             terminal.update(cx, |terminal, _| {
@@ -2663,6 +2723,7 @@ impl AgentPanel {
             true,
             focus,
             true,
+            None,
             source,
             window,
             cx,
@@ -5313,6 +5374,7 @@ impl AgentPanel {
             true,
             false,
             true,
+            None,
             source,
             window,
             cx,
@@ -6024,7 +6086,38 @@ impl AgentPanel {
                                 }),
                         )
                         .when(supports_terminal, |menu| {
-                            menu.item(
+                            let agent_terminal_item = |menu: ContextMenu,
+                                                       label: &'static str,
+                                                       agent: agent_detect::AgentKind| {
+                                menu.item(
+                                    ContextMenuEntry::new(label)
+                                        .icon(IconName::Terminal)
+                                        .icon_color(Color::Muted)
+                                        .handler({
+                                            let workspace = workspace.clone();
+                                            move |window, cx| {
+                                                if let Some(workspace) = workspace.upgrade() {
+                                                    workspace.update(cx, |workspace, cx| {
+                                                        if let Some(panel) =
+                                                            workspace.panel::<AgentPanel>(cx)
+                                                        {
+                                                            panel.update(cx, |panel, cx| {
+                                                                panel.new_agent_terminal(
+                                                                    agent,
+                                                                    Some(workspace),
+                                                                    AgentThreadSource::AgentPanel,
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            });
+                                                        }
+                                                    });
+                                                }
+                                            }
+                                        }),
+                                )
+                            };
+                            let menu = menu.item(
                                 ContextMenuEntry::new("Terminal")
                                     .when(showing_terminal, |this| this.action(Box::new(NewThread)))
                                     .when(!showing_terminal, |this| {
@@ -6053,6 +6146,16 @@ impl AgentPanel {
                                             }
                                         }
                                     }),
+                            );
+                            let menu = agent_terminal_item(
+                                menu,
+                                "Claude Code Terminal",
+                                agent_detect::AgentKind::ClaudeCode,
+                            );
+                            agent_terminal_item(
+                                menu,
+                                "Codex Terminal",
+                                agent_detect::AgentKind::Codex,
                             )
                         })
                         .map(|mut menu| {
@@ -7015,7 +7118,11 @@ impl AgentPanel {
             window,
             cx,
         );
-        Self::write_terminal_init_command(&terminal_for_init_command, init_command, cx);
+        Self::write_terminal_init_command(
+            &terminal_for_init_command,
+            init_command.into_iter().collect(),
+            cx,
+        );
         Ok(())
     }
 
@@ -7725,6 +7832,7 @@ mod tests {
                 true,
                 true,
                 true,
+                None,
                 AgentThreadSource::AgentPanel,
                 window,
                 cx,
