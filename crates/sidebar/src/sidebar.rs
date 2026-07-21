@@ -372,6 +372,18 @@ struct TerminalEntry {
     has_notification: bool,
     highlight_positions: Vec<usize>,
     agent_status: Option<TerminalAgentStatus>,
+    /// The agent recorded in persisted metadata, so rows for closed or
+    /// not-yet-restored terminals keep their agent icon and label even
+    /// without a live status.
+    persisted_agent: Option<agent_detect::AgentKind>,
+}
+
+impl TerminalEntry {
+    fn agent(&self) -> Option<agent_detect::AgentKind> {
+        self.agent_status
+            .map(|status| status.agent)
+            .or(self.persisted_agent)
+    }
 }
 
 fn terminal_agent_icon(agent: agent_detect::AgentKind) -> IconName {
@@ -1783,6 +1795,10 @@ impl Sidebar {
                     let has_notification =
                         live_notified_terminal_ids.contains(&metadata.terminal_id);
                     let agent_status = live_terminal_statuses.get(&metadata.terminal_id).copied();
+                    let persisted_agent = metadata
+                        .agent
+                        .as_deref()
+                        .and_then(agent_detect::AgentKind::from_command_name);
                     TerminalEntry {
                         metadata,
                         workspace,
@@ -1790,6 +1806,7 @@ impl Sidebar {
                         has_notification,
                         highlight_positions: Vec::new(),
                         agent_status,
+                        persisted_agent,
                     }
                 };
 
@@ -7190,8 +7207,8 @@ impl Sidebar {
     ) -> AnyElement {
         let id = ElementId::from(format!("terminal-{}", terminal.metadata.terminal_id));
         let age = format_history_entry_timestamp(terminal.metadata.created_at);
-        let timestamp = match terminal.agent_status {
-            Some(status) => SharedString::from(format!("{} · {}", status.agent.label(), age)),
+        let timestamp = match terminal.agent() {
+            Some(agent) => SharedString::from(format!("{} · {}", agent.label(), age)),
             None => age.into(),
         };
         let is_hovered = self.hovered_thread_index == Some(ix);
@@ -7217,8 +7234,8 @@ impl Sidebar {
             .base_bg(sidebar_bg)
             .icon(
                 terminal
-                    .agent_status
-                    .map(|status| terminal_agent_icon(status.agent))
+                    .agent()
+                    .map(terminal_agent_icon)
                     .unwrap_or(IconName::Terminal),
             )
             .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))

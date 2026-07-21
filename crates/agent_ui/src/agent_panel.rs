@@ -2254,7 +2254,9 @@ impl AgentPanel {
     }
 
     /// Renders an argv as a single shell command line, quoting each argument
-    /// so session ids and paths reach the program as literal data.
+    /// so session ids and paths reach the program as literal data. The
+    /// quoting is POSIX-style; captured session refs are UUID-shaped and pass
+    /// through unquoted, so PowerShell terminals still work in practice.
     fn shell_command_for_argv(argv: &[String]) -> String {
         argv.iter()
             .map(|argument| {
@@ -2691,9 +2693,15 @@ impl AgentPanel {
         };
         let agent_changed = terminal.agent_kind != agent;
         if agent_changed {
+            let previous_agent = terminal.agent_kind.or(terminal.restored_agent);
             terminal.agent_kind = agent;
             // Live detection has spoken; the restored hint is obsolete.
             terminal.restored_agent = None;
+            if agent != previous_agent {
+                // A session captured for one agent must never be replayed
+                // through another agent's resume command.
+                terminal.agent_session = None;
+            }
             terminal.status_tracker.reset();
             terminal.agent_detected_at = agent
                 .is_some()
@@ -2713,6 +2721,12 @@ impl AgentPanel {
         }
         let reschedule = terminal.status_tracker.is_holding_idle();
 
+        if agent_changed {
+            // The persisted agent label is what relaunches the CLI on
+            // restore; a status transition in the same scrape must not
+            // swallow this write.
+            self.persist_terminal_metadata(terminal_id, cx);
+        }
         if let Some((previous, published)) = transition {
             let needs_attention = published == agent_detect::AgentState::Blocked
                 || (published == agent_detect::AgentState::Idle
@@ -2721,10 +2735,8 @@ impl AgentPanel {
                 self.mark_terminal_notification(terminal_id, window, cx);
             }
             self.schedule_agent_session_capture(terminal_id, cx);
-            cx.emit(AgentPanelEvent::EntryChanged);
-            cx.notify();
-        } else if agent_changed {
-            self.persist_terminal_metadata(terminal_id, cx);
+        }
+        if agent_changed || transition.is_some() {
             cx.emit(AgentPanelEvent::EntryChanged);
             cx.notify();
         }
@@ -2760,11 +2772,18 @@ impl AgentPanel {
             return;
         }
         let home_dir = paths::home_dir().clone();
+        let current_session = terminal.agent_session.clone();
 
         terminal.session_capture_task = Some(cx.spawn(async move |this, cx| {
             let session = cx
                 .background_spawn(async move {
-                    agent_detect::session_discovery::find_session(agent, &home_dir, &cwd, since)
+                    agent_detect::session_discovery::find_session(
+                        agent,
+                        &home_dir,
+                        &cwd,
+                        since,
+                        current_session.as_deref(),
+                    )
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -6242,10 +6261,11 @@ impl AgentPanel {
                         .when(supports_terminal, |menu| {
                             let agent_terminal_item = |menu: ContextMenu,
                                                        label: &'static str,
+                                                       icon: IconName,
                                                        agent: agent_detect::AgentKind| {
                                 menu.item(
                                     ContextMenuEntry::new(label)
-                                        .icon(IconName::Terminal)
+                                        .icon(icon)
                                         .icon_color(Color::Muted)
                                         .handler({
                                             let workspace = workspace.clone();
@@ -6304,11 +6324,13 @@ impl AgentPanel {
                             let menu = agent_terminal_item(
                                 menu,
                                 "Claude Code Terminal",
+                                IconName::AiClaude,
                                 agent_detect::AgentKind::ClaudeCode,
                             );
                             agent_terminal_item(
                                 menu,
                                 "Codex Terminal",
+                                IconName::AiOpenAi,
                                 agent_detect::AgentKind::Codex,
                             )
                         })

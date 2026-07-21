@@ -243,23 +243,44 @@ pub mod session_discovery {
             .collect()
     }
 
+    /// `current_session` is the session previously captured for this
+    /// terminal; when its file is still being written it is preferred over
+    /// the globally newest one, so two agents sharing a working directory
+    /// don't steal each other's sessions on every capture.
     pub fn find_session(
         agent: AgentKind,
         home_dir: &Path,
         cwd: &Path,
         since: SystemTime,
+        current_session: Option<&str>,
     ) -> Option<String> {
         match agent {
-            AgentKind::ClaudeCode => find_claude_session(home_dir, cwd, since),
-            AgentKind::Codex => find_codex_session(home_dir, cwd, since),
+            AgentKind::ClaudeCode => find_claude_session(home_dir, cwd, since, current_session),
+            AgentKind::Codex => find_codex_session(home_dir, cwd, since, current_session),
         }
     }
 
-    fn find_claude_session(home_dir: &Path, cwd: &Path, since: SystemTime) -> Option<String> {
+    fn find_claude_session(
+        home_dir: &Path,
+        cwd: &Path,
+        since: SystemTime,
+        current_session: Option<&str>,
+    ) -> Option<String> {
         let project_dir = home_dir
             .join(".claude")
             .join("projects")
             .join(claude_project_dir_name(cwd));
+
+        if let Some(current) = current_session {
+            let current_path = project_dir.join(format!("{current}.jsonl"));
+            if fs::metadata(current_path)
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|modified| modified >= since)
+            {
+                return Some(current.to_string());
+            }
+        }
+
         let mut newest: Option<(SystemTime, String)> = None;
         for entry in fs::read_dir(project_dir).ok()?.flatten() {
             let path = entry.path();
@@ -288,13 +309,29 @@ pub mod session_discovery {
     /// Codex stores rollouts under
     /// `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<session-id>.jsonl`;
     /// the first line records the session's working directory.
-    fn find_codex_session(home_dir: &Path, cwd: &Path, since: SystemTime) -> Option<String> {
+    fn find_codex_session(
+        home_dir: &Path,
+        cwd: &Path,
+        since: SystemTime,
+        current_session: Option<&str>,
+    ) -> Option<String> {
         let sessions_dir = home_dir.join(".codex").join("sessions");
         let mut candidates: Vec<(SystemTime, PathBuf)> = Vec::new();
         collect_recent_files(&sessions_dir, since, 3, &mut candidates);
         candidates.sort_by(|(left, _), (right, _)| right.cmp(left));
 
-        let cwd_string = cwd.to_string_lossy();
+        if let Some(current) = current_session
+            && candidates.iter().any(|(_, path)| {
+                codex_session_id_from_filename(path).as_deref() == Some(current)
+            })
+        {
+            return Some(current.to_string());
+        }
+
+        // The first line is session metadata JSON; matching the exact quoted
+        // value avoids capturing a sibling directory whose path merely starts
+        // with this one (/repo/app vs /repo/app2).
+        let quoted_cwd = serde_json_style_quoted(cwd.to_string_lossy().as_ref());
         for (_, path) in candidates.into_iter().take(20) {
             let Ok(contents) = fs::File::open(&path).map(std::io::BufReader::new) else {
                 continue;
@@ -303,9 +340,7 @@ pub mod session_discovery {
             let Some(Ok(first_line)) = contents.lines().next() else {
                 continue;
             };
-            // The first line is session metadata JSON; a plain substring
-            // check for the quoted cwd avoids depending on its exact shape.
-            if !first_line.contains(cwd_string.as_ref()) {
+            if !first_line.contains(&quoted_cwd) {
                 continue;
             }
             if let Some(session_id) = codex_session_id_from_filename(&path) {
@@ -313,6 +348,22 @@ pub mod session_discovery {
             }
         }
         None
+    }
+
+    /// The cwd as it appears as a JSON string value, including the closing
+    /// quote so prefix paths don't match.
+    fn serde_json_style_quoted(value: &str) -> String {
+        let mut quoted = String::with_capacity(value.len() + 2);
+        quoted.push('"');
+        for character in value.chars() {
+            match character {
+                '"' => quoted.push_str("\\\""),
+                '\\' => quoted.push_str("\\\\"),
+                _ => quoted.push(character),
+            }
+        }
+        quoted.push('"');
+        quoted
     }
 
     fn collect_recent_files(
@@ -347,10 +398,13 @@ pub mod session_discovery {
     fn codex_session_id_from_filename(path: &Path) -> Option<String> {
         let stem = path.file_stem()?.to_str()?;
         // rollout-2026-07-21T22-15-03-<uuid>: the uuid is the last 36 chars.
-        if stem.len() < 36 {
+        // Byte indexing would panic mid-codepoint on multibyte filenames, so
+        // slice only at a verified char boundary.
+        let split = stem.len().checked_sub(36)?;
+        if !stem.is_char_boundary(split) {
             return None;
         }
-        let candidate = &stem[stem.len() - 36..];
+        let candidate = &stem[split..];
         let is_uuid = candidate.bytes().enumerate().all(|(index, byte)| {
             if matches!(index, 8 | 13 | 18 | 23) {
                 byte == b'-'
@@ -412,7 +466,7 @@ pub mod session_discovery {
             let since = SystemTime::now() + Duration::from_secs(1);
 
             assert_eq!(
-                find_session(AgentKind::ClaudeCode, &home.0, cwd, since),
+                find_session(AgentKind::ClaudeCode, &home.0, cwd, since, None),
                 None,
                 "a transcript older than the launch must not be picked up"
             );
@@ -421,8 +475,66 @@ pub mod session_discovery {
             fs::write(&live, "{}").expect("write live transcript");
             let since = SystemTime::now() - Duration::from_secs(60);
             assert_eq!(
-                find_session(AgentKind::ClaudeCode, &home.0, cwd, since).as_deref(),
+                find_session(AgentKind::ClaudeCode, &home.0, cwd, since, None).as_deref(),
                 Some("11111111-2222-3333-4444-555555555555")
+            );
+        }
+
+        #[test]
+        fn prefers_current_claude_session_still_being_written() {
+            let home = TempDir::new("claude_sticky");
+            let cwd = Path::new("/repo/app");
+            let project_dir = home
+                .0
+                .join(".claude")
+                .join("projects")
+                .join(claude_project_dir_name(cwd));
+            fs::create_dir_all(&project_dir).expect("create project dir");
+
+            let mine = "11111111-2222-3333-4444-555555555555";
+            let other = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+            fs::write(project_dir.join(format!("{mine}.jsonl")), "{}").expect("write mine");
+            fs::write(project_dir.join(format!("{other}.jsonl")), "{}").expect("write other");
+
+            let since = SystemTime::now() - Duration::from_secs(60);
+            assert_eq!(
+                find_session(AgentKind::ClaudeCode, &home.0, cwd, since, Some(mine)).as_deref(),
+                Some(mine),
+                "an actively-written current session must not be replaced by a newer sibling"
+            );
+        }
+
+        #[test]
+        fn codex_cwd_match_requires_exact_quoted_value() {
+            let home = TempDir::new("codex_prefix");
+            let cwd = Path::new("/repo/app");
+            let day_dir = home
+                .0
+                .join(".codex")
+                .join("sessions")
+                .join("2026")
+                .join("07")
+                .join("21");
+            fs::create_dir_all(&day_dir).expect("create sessions dir");
+
+            let sibling = day_dir
+                .join("rollout-2026-07-21T12-00-00-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
+            let mut file = fs::File::create(&sibling).expect("create sibling rollout");
+            writeln!(file, r#"{{"type":"session_meta","cwd":"/repo/app2"}}"#).expect("write");
+
+            let since = SystemTime::now() - Duration::from_secs(60);
+            assert_eq!(
+                find_session(AgentKind::Codex, &home.0, cwd, since, None),
+                None,
+                "/repo/app must not match a session recorded for /repo/app2"
+            );
+        }
+
+        #[test]
+        fn codex_session_id_ignores_multibyte_filenames_without_panicking() {
+            assert_eq!(
+                codex_session_id_from_filename(Path::new("rollout-ünïcödé-😀😀😀😀😀😀😀.jsonl")),
+                None
             );
         }
 
@@ -451,7 +563,7 @@ pub mod session_discovery {
 
             let since = SystemTime::now() - Duration::from_secs(60);
             assert_eq!(
-                find_session(AgentKind::Codex, &home.0, cwd, since).as_deref(),
+                find_session(AgentKind::Codex, &home.0, cwd, since, None).as_deref(),
                 Some("12345678-9abc-def0-1234-56789abcdef0")
             );
         }
@@ -771,6 +883,17 @@ fn claude_rules() -> &'static [Rule] {
                             Gate::contains(&["enter to select"]),
                         ]),
                 ),
+            // Startup folder-trust dialog blocks everything until answered.
+            Rule::new(AgentState::Blocked, 860, Region::WholeRecent)
+                .visible()
+                .gate(
+                    Gate::contains(&["do you trust the files in this folder?"]).with_all(vec![
+                        Gate::default().with_any(vec![
+                            Gate::line_regex(&[r"(?i)^\s*❯?\s*1\.\s*yes"]),
+                            Gate::contains(&["enter to confirm"]),
+                        ]),
+                    ]),
+                ),
             // Bash permission prompt with a numbered yes/no menu.
             Rule::new(AgentState::Blocked, 850, Region::WholeRecent)
                 .visible()
@@ -823,6 +946,11 @@ fn claude_rules() -> &'static [Rule] {
                     ])
                     .with_not(vec![Gate::regex(&[r"(?m)^\s*❯\s*$"])]),
             ),
+            // Screen fallback for terminals whose OSC title isn't forwarded:
+            // the live status line during generation offers esc to interrupt.
+            Rule::new(AgentState::Working, 500, Region::BottomNonEmptyLines(6))
+                .visible()
+                .gate(Gate::contains(&["esc to interrupt"])),
             // ✳ leading the OSC title is the resting sparkle.
             Rule::new(AgentState::Idle, 250, Region::OscTitle)
                 .visible()
@@ -1007,6 +1135,28 @@ old scrollback with Do you want to proceed?
 Showing detailed transcript · ctrl+o to toggle";
         let detection = detect_screen(AgentKind::ClaudeCode, screen);
         assert!(detection.skip_state_update);
+    }
+
+    #[test]
+    fn claude_folder_trust_dialog_is_blocked() {
+        let screen = "\
+ Do you trust the files in this folder?
+ /Users/foo/repo
+ ❯ 1. Yes, proceed
+   2. No, exit";
+        let detection = detect_screen(AgentKind::ClaudeCode, screen);
+        assert_eq!(detection.state, AgentState::Blocked);
+        assert!(detection.visible_blocker);
+    }
+
+    #[test]
+    fn claude_esc_to_interrupt_line_is_working_without_osc_title() {
+        let screen = "\
+some output
+✳ Shimmying… (2s · esc to interrupt)";
+        let detection = detect_screen(AgentKind::ClaudeCode, screen);
+        assert_eq!(detection.state, AgentState::Working);
+        assert!(detection.visible_working);
     }
 
     #[test]
