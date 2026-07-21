@@ -203,6 +203,7 @@ pub struct AgentPanelTerminalInfo {
     pub has_notification: bool,
     pub custom_title: Option<SharedString>,
     pub working_directory: Option<PathBuf>,
+    pub agent_status: Option<TerminalAgentStatus>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -3581,6 +3582,9 @@ impl AgentPanel {
                 has_notification: terminal.has_notification,
                 custom_title: terminal.custom_title(cx),
                 working_directory: terminal.working_directory.clone(),
+                agent_status: terminal.agent_kind.zip(terminal.status_tracker.published_state()).map(
+                    |(agent, state)| TerminalAgentStatus { agent, state },
+                ),
             })
             .collect()
     }

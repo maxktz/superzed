@@ -19,7 +19,8 @@ use agent_ui::{
     AcpThreadImportOnboarding, Agent, AgentPanel, AgentPanelEvent, AgentThreadItem,
     AgentThreadSource, ArchiveSelectedThread, ConversationView, CrossChannelImportOnboarding,
     DEFAULT_THREAD_TITLE, ManageProfiles, NewTerminalThread, NewThread, RenameSelectedThread,
-    TerminalId, ThreadId, ThreadImportModal, ThreadTitleRegenerationResult, ToggleOptionsMenu,
+    TerminalAgentStatus, TerminalId, ThreadId, ThreadImportModal, ThreadTitleRegenerationResult,
+    ToggleOptionsMenu,
     channels_with_threads, connection_store_for_project, create_agent_thread_in_workspace,
     import_threads_from_other_channels,
 };
@@ -370,6 +371,19 @@ struct TerminalEntry {
     worktrees: Vec<ThreadItemWorktreeInfo>,
     has_notification: bool,
     highlight_positions: Vec<usize>,
+    agent_status: Option<TerminalAgentStatus>,
+}
+
+/// Maps a scraped terminal-agent state onto the display status shared with
+/// ACP thread rows.
+fn terminal_agent_thread_status(status: TerminalAgentStatus) -> AgentThreadStatus {
+    match status.state {
+        agent_detect::AgentState::Working => AgentThreadStatus::Running,
+        agent_detect::AgentState::Blocked => AgentThreadStatus::WaitingForConfirmation,
+        agent_detect::AgentState::Idle | agent_detect::AgentState::Unknown => {
+            AgentThreadStatus::Completed
+        }
+    }
 }
 
 impl ThreadEntry {
@@ -598,10 +612,23 @@ impl ThreadFilters {
                 || self.statuses.iter().any(|filter| filter.matches(status)))
     }
 
-    /// Terminal rows carry no agent or run status, so they cannot match an
-    /// agent or status filter.
-    fn hides_terminals(&self) -> bool {
-        !self.agents.is_empty() || !self.statuses.is_empty()
+    /// Terminal agents (a CLI scraped for status) aren't ACP agents, so any
+    /// agent filter hides them; status filters match their scraped state when
+    /// one is known.
+    fn matches_terminal(&self, agent_status: Option<TerminalAgentStatus>) -> bool {
+        if !self.agents.is_empty() {
+            return false;
+        }
+        if self.statuses.is_empty() {
+            return true;
+        }
+        match agent_status {
+            Some(status) => {
+                let status = terminal_agent_thread_status(status);
+                self.statuses.iter().any(|filter| filter.matches(status))
+            }
+            None => false,
+        }
     }
 
     fn matches_group(&self, key: &ProjectGroupKey) -> bool {
@@ -1674,15 +1701,17 @@ impl Sidebar {
 
         let groups = mw.project_groups(cx);
         let mut live_notified_terminal_ids: HashSet<TerminalId> = HashSet::new();
+        let mut live_terminal_statuses: HashMap<TerminalId, TerminalAgentStatus> = HashMap::new();
         for workspace in &workspaces {
             if let Some(agent_panel) = workspace.read(cx).panel::<AgentPanel>(cx) {
-                live_notified_terminal_ids.extend(
-                    agent_panel
-                        .read(cx)
-                        .terminals(cx)
-                        .into_iter()
-                        .filter_map(|terminal| terminal.has_notification.then_some(terminal.id)),
-                );
+                for terminal in agent_panel.read(cx).terminals(cx) {
+                    if terminal.has_notification {
+                        live_notified_terminal_ids.insert(terminal.id);
+                    }
+                    if let Some(agent_status) = terminal.agent_status {
+                        live_terminal_statuses.insert(terminal.id, agent_status);
+                    }
+                }
             }
         }
 
@@ -1746,12 +1775,14 @@ impl Sidebar {
                         worktree_info_from_thread_paths(&metadata.worktree_paths, &branch_by_path);
                     let has_notification =
                         live_notified_terminal_ids.contains(&metadata.terminal_id);
+                    let agent_status = live_terminal_statuses.get(&metadata.terminal_id).copied();
                     TerminalEntry {
                         metadata,
                         workspace,
                         worktrees,
                         has_notification,
                         highlight_positions: Vec::new(),
+                        agent_status,
                     }
                 };
 
@@ -2108,6 +2139,14 @@ impl Sidebar {
                 }
             }
 
+            for terminal in &terminals {
+                match terminal.agent_status.map(terminal_agent_thread_status) {
+                    Some(AgentThreadStatus::Running) => has_running_threads = true,
+                    Some(AgentThreadStatus::WaitingForConfirmation) => waiting_thread_count += 1,
+                    _ => {}
+                }
+            }
+
             let unfiltered_row_count = threads.len() + terminals.len();
             if self.thread_filters.is_filtering() {
                 // Track filtered-out thread ids so notification and recency
@@ -2117,9 +2156,9 @@ impl Sidebar {
                     self.thread_filters
                         .matches_thread(&thread.metadata.agent_id, thread.status)
                 });
-                if self.thread_filters.hides_terminals() {
-                    terminals.clear();
-                }
+                terminals.retain(|terminal| {
+                    self.thread_filters.matches_terminal(terminal.agent_status)
+                });
             }
 
             let has_visible_rows = !threads.is_empty() || !terminals.is_empty();
@@ -7143,7 +7182,11 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = ElementId::from(format!("terminal-{}", terminal.metadata.terminal_id));
-        let timestamp = format_history_entry_timestamp(terminal.metadata.created_at);
+        let age = format_history_entry_timestamp(terminal.metadata.created_at);
+        let timestamp = match terminal.agent_status {
+            Some(status) => SharedString::from(format!("{} · {}", status.agent.label(), age)),
+            None => age.into(),
+        };
         let is_hovered = self.hovered_thread_index == Some(ix);
         let color = cx.theme().colors();
         let sidebar_bg = color.editor_background;
@@ -7167,6 +7210,9 @@ impl Sidebar {
             .base_bg(sidebar_bg)
             .icon(IconName::Terminal)
             .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
+            .when_some(terminal.agent_status, |this, status| {
+                this.status(terminal_agent_thread_status(status))
+            })
             .is_remote(is_remote)
             .worktrees(worktrees)
             .timestamp(timestamp)

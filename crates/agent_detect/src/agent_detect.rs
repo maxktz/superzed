@@ -151,6 +151,13 @@ impl StatusTracker {
         self.published
     }
 
+    /// A Working -> Idle transition is currently being held for confirmation.
+    /// Callers should re-run detection shortly even if the terminal produces
+    /// no further output, since a finished agent goes quiet.
+    pub fn is_holding_idle(&self) -> bool {
+        self.pending_idle_started_at.is_some()
+    }
+
     /// Feed one detection; returns the newly published state when it changed.
     pub fn update(&mut self, detection: Detection, now: Instant) -> Option<AgentState> {
         if detection.skip_state_update {
