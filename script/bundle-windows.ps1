@@ -40,8 +40,17 @@ function Get-VSArch {
     }
 }
 
+# Locate Visual Studio via vswhere: GitHub-hosted runners ship Enterprise, local
+# machines typically Community, so the edition can't be hardcoded.
+$vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$vsDevShell = if (Test-Path $vsWhere) {
+    $vsRoot = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    "$vsRoot\Common7\Tools\Launch-VsDevShell.ps1"
+} else {
+    "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1"
+}
 Push-Location
-& "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
+& $vsDevShell -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
 Pop-Location
 
 $target = "$Architecture-pc-windows-msvc"
@@ -117,7 +126,8 @@ function BuildZedAndItsFriends {
     Write-Output "Building Zed and its friends, for channel: $channel"
     # Build zed.exe, cli.exe and auto_update_helper.exe
     cargo build --release --package zed --package cli --package auto_update_helper --target $target
-    Copy-Item -Path ".\$CargoOutDir\zed.exe" -Destination "$innoDir\Zed.exe" -Force
+    # The zed package's binary is named `superzed` in this fork.
+    Copy-Item -Path ".\$CargoOutDir\superzed.exe" -Destination "$innoDir\Zed.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\cli.exe" -Destination "$innoDir\cli.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\auto_update_helper.exe" -Destination "$innoDir\auto_update_helper.exe" -Force
     # Build explorer_command_injector.dll
@@ -155,15 +165,21 @@ function BuildRemoteServer {
 }
 
 function ZipZedAndItsFriendsDebug {
+    # Builds with debuginfo disabled (e.g. CARGO_PROFILE_RELEASE_DEBUG=0 on CI)
+    # produce no .pdb files; skip the archive instead of failing.
     $items = @(
-        ".\$CargoOutDir\zed.pdb",
+        ".\$CargoOutDir\superzed.pdb",
         ".\$CargoOutDir\cli.pdb",
         ".\$CargoOutDir\auto_update_helper.pdb",
         ".\$CargoOutDir\explorer_command_injector.pdb",
         ".\$CargoOutDir\remote_server.pdb"
-    )
+    ) | Where-Object { Test-Path $_ }
 
-    Compress-Archive -Path $items -DestinationPath ".\$CargoOutDir\zed-$env:RELEASE_VERSION-$env:ZED_RELEASE_CHANNEL.dbg.zip" -Force
+    if ($items.Count -gt 0) {
+        Compress-Archive -Path $items -DestinationPath ".\$CargoOutDir\zed-$env:RELEASE_VERSION-$env:ZED_RELEASE_CHANNEL.dbg.zip" -Force
+    } else {
+        Write-Output "No .pdb files found; skipping debug symbol archive"
+    }
 }
 
 
@@ -207,8 +223,13 @@ function MakeAppx {
         }
     }
     Copy-Item -Path "$manifestFile" -Destination "$innoDir\make_appx\AppxManifest.xml"
-    # Add makeAppx.exe to Path
+    # Add makeAppx.exe to Path, falling back to the newest installed SDK when
+    # the pinned version is absent (GitHub-hosted runner images vary).
     $sdk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64"
+    if (-not (Test-Path "$sdk\makeappx.exe")) {
+        $sdk = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\10.0.*\x64\makeappx.exe" |
+            Sort-Object FullName | Select-Object -Last 1 | ForEach-Object { $_.DirectoryName }
+    }
     $env:Path += ';' + $sdk
     makeAppx.exe pack /d "$innoDir\make_appx" /p "$innoDir\zed_explorer_command_injector.appx" /nv
 }
