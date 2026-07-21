@@ -2576,6 +2576,55 @@ impl AgentPanel {
         }
     }
 
+    /// A one-line strip under the terminal mirroring the chat header of ACP
+    /// threads: agent · working directory · branch.
+    fn render_terminal_agent_footer(&self, cx: &Context<Self>) -> Option<Div> {
+        let terminal_id = self.active_terminal_id()?;
+        let terminal = self.terminals.get(&terminal_id)?;
+        let agent = terminal.agent_kind?;
+
+        let mut parts = vec![agent.label().to_string()];
+        let working_directory = terminal.working_directory.clone();
+        if let Some(working_directory) = &working_directory {
+            use util::paths::PathExt as _;
+            parts.push(working_directory.compact().to_string_lossy().into_owned());
+        }
+        if let Some(working_directory) = &working_directory {
+            let project = self.project.read(cx);
+            let branch = project.repositories(cx).values().find_map(|repo| {
+                let snapshot = repo.read(cx).snapshot();
+                working_directory
+                    .starts_with(&snapshot.work_directory_abs_path)
+                    .then(|| {
+                        snapshot
+                            .branch
+                            .as_ref()
+                            .map(|branch| branch.name().to_string())
+                    })
+                    .flatten()
+            });
+            if let Some(branch) = branch {
+                parts.push(branch);
+            }
+        }
+
+        Some(
+            h_flex()
+                .flex_none()
+                .justify_center()
+                .py(DynamicSpacing::Base04.rems(cx))
+                .px(DynamicSpacing::Base08.rems(cx))
+                .border_t_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    Label::new(parts.join(" · "))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .truncate(),
+                ),
+        )
+    }
+
     pub fn terminal_agent_status(&self, terminal_id: TerminalId) -> Option<TerminalAgentStatus> {
         let terminal = self.terminals.get(&terminal_id)?;
         let agent = terminal.agent_kind?;
@@ -6957,7 +7006,8 @@ impl Render for AgentPanel {
                                 )
                             })
                         })
-                        .child(terminal_view.clone());
+                        .child(terminal_view.clone())
+                        .children(self.render_terminal_agent_footer(cx));
 
                     parent
                         .child(terminal_content)

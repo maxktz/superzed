@@ -374,6 +374,13 @@ struct TerminalEntry {
     agent_status: Option<TerminalAgentStatus>,
 }
 
+fn terminal_agent_icon(agent: agent_detect::AgentKind) -> IconName {
+    match agent {
+        agent_detect::AgentKind::ClaudeCode => IconName::AiClaude,
+        agent_detect::AgentKind::Codex => IconName::AiOpenAi,
+    }
+}
+
 /// Maps a scraped terminal-agent state onto the display status shared with
 /// ACP thread rows.
 fn terminal_agent_thread_status(status: TerminalAgentStatus) -> AgentThreadStatus {
@@ -7208,7 +7215,12 @@ impl Sidebar {
 
         ThreadItem::new(id, title)
             .base_bg(sidebar_bg)
-            .icon(IconName::Terminal)
+            .icon(
+                terminal
+                    .agent_status
+                    .map(|status| terminal_agent_icon(status.agent))
+                    .unwrap_or(IconName::Terminal),
+            )
             .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
             .when_some(terminal.agent_status, |this, status| {
                 this.status(terminal_agent_thread_status(status))
